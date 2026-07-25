@@ -55,14 +55,14 @@ npm install
 npx playwright install chromium
 
 # Linux/macOS
-export NUWAX_PHONE="18627070660"
+export NUWAX_PHONE="139*******"
 export NUWAX_PASSWORD="your-password"
 export TG_BOT_TOKEN="your-bot-token"
 export TG_CHAT_ID="your-chat-id"
 node src/index.js --debug
 
 # Windows PowerShell
-$env:NUWAX_PHONE="18627070660"
+$env:NUWAX_PHONE="139*******"
 $env:NUWAX_PASSWORD="your-password"
 $env:TG_BOT_TOKEN="your-bot-token"
 $env:TG_CHAT_ID="your-chat-id"
