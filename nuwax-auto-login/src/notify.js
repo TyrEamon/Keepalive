@@ -29,7 +29,7 @@ export async function sendNotify({ status, message, credit, screenshotUrl }) {
   text += `📋 状态: ${message}\n`;
 
   if (credit) {
-    text += `💰 积分: ${credit}\n`;
+    text += `💰 余额: ${credit}\n`;
   }
 
   if (screenshotUrl) {

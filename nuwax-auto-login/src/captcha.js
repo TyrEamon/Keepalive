@@ -8,48 +8,8 @@ function sleep(ms) {
 }
 
 /**
- * 生成贝塞尔曲线路径点（更自然的曲线）
- */
-function generateBezierPath(fromX, toX, startY, steps = 55) {
-  const points = [];
-  const distance = toX - fromX;
-
-  // 控制点：更自然的曲线，Y 轴有轻微波动
-  const cp1x = fromX + distance * (0.2 + Math.random() * 0.15);
-  const cp1y = (Math.random() - 0.5) * 8;
-  const cp2x = fromX + distance * (0.65 + Math.random() * 0.15);
-  const cp2y = (Math.random() - 0.5) * 8;
-
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    const x = Math.pow(1 - t, 3) * fromX +
-      3 * Math.pow(1 - t, 2) * t * cp1x +
-      3 * (1 - t) * Math.pow(t, 2) * cp2x +
-      Math.pow(t, 3) * toX;
-    const y = Math.pow(1 - t, 3) * startY +
-      3 * Math.pow(1 - t, 2) * t * cp1y +
-      3 * (1 - t) * Math.pow(t, 2) * cp2y +
-      Math.pow(t, 3) * startY;
-    points.push({ x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100 });
-  }
-  return points;
-}
-
-/**
- * 获取步进延迟（模拟人类变速 - 更自然）
- */
-function getStepDelay(totalSteps, currentStep) {
-  const progress = currentStep / totalSteps;
-  // 起始阶段：慢（犹豫），中段：快（果断拖拽），末段：慢（微调）
-  if (progress < 0.15) return 15 + Math.random() * 10;     // 起始犹豫
-  if (progress < 0.3) return 10 + Math.random() * 6;       // 加速
-  if (progress < 0.7) return 5 + Math.random() * 4;        // 高速拖拽
-  if (progress < 0.9) return 8 + Math.random() * 6;        // 减速
-  return 16 + Math.random() * 14;                           // 终点微调
-}
-
-/**
  * 解决阿里云滑块验证码
+ * 使用简化但可靠的类人拖拽方式
  * @param {import('playwright').Page} page
  * @returns {Promise<boolean>}
  */
@@ -78,32 +38,43 @@ export async function solveSlider(page) {
     if (!distance) throw new Error('无法计算滑块距离');
     console.log(`[captcha] 距离: ${Math.round(distance)}px`);
 
-    // 1. 鼠标移到滑块上方
+    // 1. 鼠标移到滑块上方（带小偏移）
     await page.mouse.move(
-      startX + (Math.random() - 0.5) * 3,
-      startY + (Math.random() - 0.5) * 3,
-      { steps: 5 }
+      startX + (Math.random() - 0.5) * 5,
+      startY + (Math.random() - 0.5) * 5
     );
-    await sleep(150 + Math.random() * 200);
+    await sleep(200 + Math.random() * 300);
 
     // 2. 按下鼠标
     await page.mouse.down();
-    await sleep(40 + Math.random() * 60);
+    await sleep(50 + Math.random() * 80);
 
-    // 3. 贝塞尔路径拖拽
-    const pathPoints = generateBezierPath(startX, targetX);
-    for (let i = 0; i < pathPoints.length; i++) {
-      const point = pathPoints[i];
-      const jitterX = (Math.random() - 0.5) * 1.5;
-      const jitterY = (Math.random() - 0.5) * 1.5;
-      await page.mouse.move(point.x + jitterX, startY + point.y + jitterY, { steps: 1 });
-      await sleep(getStepDelay(pathPoints.length, i));
+    // 3. 自然拖拽（渐出曲线 + 正弦波 Y 轴摆动）
+    const steps = 60;
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      // ease-out 缓动（起始快，终点慢）
+      const easeOut = 1 - Math.pow(1 - t, 3);
+      const x = startX + (targetX - startX) * easeOut;
+      // 正弦波 Y 轴摆动 + 随机抖动
+      const yOffset = Math.sin(t * Math.PI) * 4;
+      const jitter = (Math.random() - 0.5) * 2;
+      const y = startY + yOffset + jitter;
+
+      await page.mouse.move(x, y);
+
+      // 变速延迟：起始慢 → 中段快 → 终点慢
+      let delay;
+      if (t < 0.15) delay = 15 + Math.random() * 10;
+      else if (t < 0.7) delay = 6 + Math.random() * 4;
+      else delay = 12 + Math.random() * 10;
+      await sleep(delay);
     }
 
     // 4. 终点微调
+    await sleep(100 + Math.random() * 150);
+    await page.mouse.move(targetX + (Math.random() - 0.5) * 3, startY + (Math.random() - 0.5) * 2);
     await sleep(80 + Math.random() * 100);
-    await page.mouse.move(targetX + (Math.random() - 0.5) * 2, startY, { steps: 2 });
-    await sleep(60 + Math.random() * 80);
 
     // 5. 释放鼠标
     await page.mouse.up();
@@ -112,10 +83,10 @@ export async function solveSlider(page) {
     // 6. 等待验证结果
     await sleep(3000);
 
-    // 7. 检查验证是否通过（mask 消失或滑块消失）
+    // 7. 检查验证是否通过
     const passed = await page.evaluate(() => {
       const mask = document.querySelector('#aliyunCaptcha-mask');
-      if (!mask) return true; // mask 不存在 = 通过
+      if (!mask) return true;
       return mask.className.includes('hidden') || !mask.className.includes('show');
     });
 

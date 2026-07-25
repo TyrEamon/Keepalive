@@ -44,14 +44,8 @@ export async function doLogin({ phone, password, debug = false }) {
     const page = await context.newPage();
 
     // 拦截 Aliyun CAPTCHA 行为数据上报（关键：防止自动化检测）
+    // 只拦截主上报端点，让备份端点和设备指纹正常通信
     await page.route('**/upload.captcha-open.aliyuncs.com/**', (route) => {
-      route.abort();
-    });
-    await page.route('**/upload.captcha-open-b.aliyuncs.com/**', (route) => {
-      route.abort();
-    });
-    // 拦截设备指纹采集
-    await page.route('**/cloudauth-device*', (route) => {
       route.abort();
     });
 
