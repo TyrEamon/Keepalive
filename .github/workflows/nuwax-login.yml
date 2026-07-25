@@ -1,0 +1,49 @@
+name: nuwax-auto-login
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # 每天 UTC 8:00（北京时间 16:00）
+  workflow_dispatch:        # 支持手动触发
+
+jobs:
+  auto-login:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: 'npm'
+          cache-dependency-path: nuwax-auto-login/package-lock.json
+
+      - name: 安装依赖
+        run: |
+          cd nuwax-auto-login
+          npm ci
+
+      - name: 安装 Playwright Chromium
+        run: |
+          cd nuwax-auto-login
+          npx playwright install chromium
+
+      - name: 执行自动登录
+        env:
+          NUWAX_PHONE: ${{ secrets.NUWAX_PHONE }}
+          NUWAX_PASSWORD: ${{ secrets.NUWAX_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          NUWAX_COOKIE: ${{ vars.NUWAX_COOKIE }}
+        run: |
+          cd nuwax-auto-login
+          node src/index.js
+
+      - name: 上传失败截图（调试用）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: nuwax-auto-login/screenshots/
+          retention-days: 3
