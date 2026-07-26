@@ -41,10 +41,10 @@ log = logging.getLogger("checkin")
 # ---------------------------------------------------------------------------
 
 def mask(name: str) -> str:
-    """用户名/邮箱脱敏：显示前 4 位 + ●●●●●"""
+    """用户名/邮箱脱敏：显示前 4 位 + *****"""
     if not name:
-        return "●●●●●"
-    return (name[:4] + "●●●●●") if len(name) > 4 else (name + "●●●●●")
+        return "*****"
+    return (name[:4] + "*****") if len(name) > 4 else (name + "*****")
 
 
 def quota_to_usd(quota: int) -> float:
@@ -191,7 +191,6 @@ def main():
         "username": mask(user.get("username") or USERNAME),
         "date": bjt_date_str(),
         "checked_in": not new_checkin,  # notify: True=今日已签到, False=新签到
-        "reward_usd": 0.0,
         "balance_usd": balance_usd,
     }
     try:
