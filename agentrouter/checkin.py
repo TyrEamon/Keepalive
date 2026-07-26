@@ -23,6 +23,8 @@ BASE_URL = os.getenv("AGENTROUTER_BASE_URL") or "https://agentrouter.org"
 ACCESS_TOKEN = os.getenv("AGENTROUTER_ACCESS_TOKEN") or ""
 # 用户数字 ID（管理 API 需要的 New-API-User 头）
 USER_ID = os.getenv("AGENTROUTER_USER_ID") or ""
+# 是否打印诊断信息（默认开启，便于排查 WAF/非 JSON 返回）
+DEBUG = (os.getenv("AGENTROUTER_DEBUG") or "1") not in ("0", "false", "False")
 
 # New-API 配额 → 美元换算：1 USD = 500000 quota（如与实际不符可调整此值）
 QUOTA_PER_UNIT = 500000
@@ -54,12 +56,29 @@ def bjt_date_str() -> str:
     return f"{now.year}年{now.month:02d}月{now.day:02d}日"
 
 
+def parse_json(resp: requests.Response, tag: str) -> dict:
+    """
+    统一解析 JSON 响应；若失败则打印诊断信息（状态码、Content-Type、响应体片段）。
+    返回 dict（解析失败返回 {}）。
+    """
+    if DEBUG:
+        log.info("[诊断] %s -> HTTP %s, Content-Type=%s, 长度=%s",
+                 tag, resp.status_code,
+                 resp.headers.get("Content-Type"), len(resp.text))
+    try:
+        return resp.json()
+    except ValueError:
+        log.error("[诊断] %s 响应非 JSON（可能被 WAF 拦截）。前 500 字符:\n%s",
+                  tag, resp.text[:500])
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # API 调用
 # ---------------------------------------------------------------------------
 
 def create_session() -> requests.Session:
-    """创建预配置的 requests Session（携带访问令牌与用户 ID 头）"""
+    """创建预配置的 requests Session（携带访问令牌与仿浏览器请求头）"""
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
@@ -68,8 +87,22 @@ def create_session() -> requests.Session:
             "Chrome/125.0.0.0 Safari/537.36"
         ),
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Cache-Control": "no-store",
+        # 系统访问令牌：New-API 管理 API 用 Authorization 头鉴权，
+        # token 直接放入，【不能】加 "Bearer " 前缀
         "Authorization": ACCESS_TOKEN,
+        # 管理 API 需要 New-API-User 头标识当前用户
         "New-API-User": USER_ID,
+        # 补充浏览器指纹头，尽量规避阿里云 WAF 的简单拦截
+        "Referer": f"{BASE_URL}/console/personal",
+        "Origin": BASE_URL,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
     })
     return session
 
@@ -79,7 +112,8 @@ def is_token_valid(session: requests.Session) -> bool:
     url = f"{BASE_URL}/api/user/self"
     try:
         resp = session.get(url, timeout=15)
-        return resp.json().get("success", False)
+        data = parse_json(resp, "GET /api/user/self")
+        return data.get("success", False)
     except Exception as e:
         log.error("校验访问令牌异常: %s", e)
         return False
@@ -103,7 +137,7 @@ def get_checkin_status(session: requests.Session) -> dict:
     url = f"{BASE_URL}/api/user/checkin"
     try:
         resp = session.get(url, timeout=15)
-        data = resp.json()
+        data = parse_json(resp, "GET /api/user/checkin")
         if data.get("success"):
             return data.get("data", {})
         log.warning("查询签到状态失败: %s", data.get("message", ""))
@@ -118,7 +152,7 @@ def do_checkin(session: requests.Session) -> dict:
     url = f"{BASE_URL}/api/user/checkin"
     try:
         resp = session.post(url, timeout=15)
-        data = resp.json()
+        data = parse_json(resp, "POST /api/user/checkin")
 
         msg = data.get("message", "")
         if not data.get("success"):
