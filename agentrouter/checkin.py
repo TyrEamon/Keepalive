@@ -1,38 +1,33 @@
 #!/usr/bin/env python3
 """
 AgentRouter 每日签到脚本（GitHub Actions 专用）
-使用「系统访问令牌」免登录调用接口：查询签到状态、执行签到、获取余额，
-并通过 TG 发送通知。
 
-说明：agentrouter.org 使用 GitHub OAuth 登录，无法用账号密码自动登录，
-因此改用站点「个人设置 → 系统访问令牌」生成的 Access Token 调用管理 API。
-注意：New-API 管理接口的 Authorization 头需直接放 token，【不能】加 "Bearer " 前缀。
+需要的配置（环境变量）：
+  AGENTROUTER_USERNAME  登录用户名或邮箱
+  AGENTROUTER_PASSWORD  登录密码
+  SOCKS5_PROXY          代理，可多个（换行或逗号分隔），如
+                        socks5://user:pass@host:port
 """
 
 import os
+import re
 import sys
 import logging
 from datetime import datetime, timezone, timedelta
 import requests
 
 # ---------------------------------------------------------------------------
-# 配置（从环境变量读取）
+# 配置
 # ---------------------------------------------------------------------------
 BASE_URL = os.getenv("AGENTROUTER_BASE_URL") or "https://agentrouter.org"
-# 系统访问令牌（个人设置中生成，长期有效）
-ACCESS_TOKEN = os.getenv("AGENTROUTER_ACCESS_TOKEN") or ""
-# 用户数字 ID（管理 API 需要的 New-API-User 头）
-USER_ID = os.getenv("AGENTROUTER_USER_ID") or ""
-# 是否打印诊断信息（默认开启，便于排查 WAF/非 JSON 返回）
-DEBUG = (os.getenv("AGENTROUTER_DEBUG") or "1") not in ("0", "false", "False")
+USERNAME = os.getenv("AGENTROUTER_USERNAME") or ""
+PASSWORD = os.getenv("AGENTROUTER_PASSWORD") or ""
+PROXY_ENV = os.getenv("SOCKS5_PROXY") or ""
 
-# New-API 配额 → 美元换算：1 USD = 500000 quota（如与实际不符可调整此值）
+# New-API 配额 → 美元换算：1 USD = 500000 quota
 QUOTA_PER_UNIT = 500000
-
-# 北京时间时区
 BJT = timezone(timedelta(hours=8))
 
-# 日志
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -45,144 +40,113 @@ log = logging.getLogger("checkin")
 # 工具函数
 # ---------------------------------------------------------------------------
 
+def mask(name: str) -> str:
+    """用户名/邮箱脱敏：显示前 4 位 + ●●●●●"""
+    if not name:
+        return "●●●●●"
+    return (name[:4] + "●●●●●") if len(name) > 4 else (name + "●●●●●")
+
+
 def quota_to_usd(quota: int) -> float:
-    """将 quota 转换为美元"""
-    return quota / QUOTA_PER_UNIT
+    return (quota or 0) / QUOTA_PER_UNIT
 
 
 def bjt_date_str() -> str:
-    """北京时间日期字符串，如 '2026年07月09日'"""
     now = datetime.now(BJT)
     return f"{now.year}年{now.month:02d}月{now.day:02d}日"
 
 
-def parse_json(resp: requests.Response, tag: str) -> dict:
-    """
-    统一解析 JSON 响应；若失败则打印诊断信息（状态码、Content-Type、响应体片段）。
-    返回 dict（解析失败返回 {}）。
-    """
-    if DEBUG:
-        log.info("[诊断] %s -> HTTP %s, Content-Type=%s, 长度=%s",
-                 tag, resp.status_code,
-                 resp.headers.get("Content-Type"), len(resp.text))
+def parse_proxies(raw: str) -> list:
+    """解析代理配置（换行或逗号分隔），socks/socks5 统一转 socks5h（DNS 也走代理）"""
+    proxies = []
+    for item in re.split(r"[\n,]+", raw):
+        url = item.strip()
+        if not url:
+            continue
+        if url.startswith("socks5://"):
+            url = "socks5h://" + url[len("socks5://"):]
+        elif url.startswith("socks://"):
+            url = "socks5h://" + url[len("socks://"):]
+        proxies.append(url)
+    return proxies
+
+
+def get_json(resp: requests.Response):
+    """解析 JSON；被 WAF 拦截或非 JSON 时返回 None"""
     try:
         return resp.json()
     except ValueError:
-        log.error("[诊断] %s 响应非 JSON（可能被 WAF 拦截）。前 500 字符:\n%s",
-                  tag, resp.text[:500])
-        return {}
+        if "aliyun_waf" in resp.text:
+            log.warning("响应被阿里云 WAF 拦截（当前 IP/代理不可用）")
+        return None
 
 
 # ---------------------------------------------------------------------------
-# API 调用
+# 会话与 API
 # ---------------------------------------------------------------------------
 
-def create_session() -> requests.Session:
-    """创建预配置的 requests Session（携带访问令牌与仿浏览器请求头）"""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
+def create_session(proxy_url: str = "") -> requests.Session:
+    """创建仿浏览器 Session（可选代理）"""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/125.0.0.0 Safari/537.36"),
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Cache-Control": "no-store",
-        # 系统访问令牌：New-API 管理 API 用 Authorization 头鉴权，
-        # token 直接放入，【不能】加 "Bearer " 前缀
-        "Authorization": ACCESS_TOKEN,
-        # 管理 API 需要 New-API-User 头标识当前用户
-        "New-API-User": USER_ID,
-        # 补充浏览器指纹头，尽量规避阿里云 WAF 的简单拦截
-        "Referer": f"{BASE_URL}/console/personal",
+        "Content-Type": "application/json",
+        "Referer": f"{BASE_URL}/login",
         "Origin": BASE_URL,
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
     })
-    return session
+    if proxy_url:
+        s.proxies.update({"http": proxy_url, "https": proxy_url})
+    return s
 
 
-def is_token_valid(session: requests.Session) -> bool:
-    """检查访问令牌是否有效（能否获取用户信息）"""
-    url = f"{BASE_URL}/api/user/self"
+def build_working_session():
+    """逐个尝试代理 + 直连，返回第一个能绕过 WAF 的 session；全部失败返回 None"""
+    proxies = parse_proxies(PROXY_ENV)
+    attempts = [(p, p.split("@")[-1]) for p in proxies] + [("", "直连（无代理）")]
+    for proxy_url, label in attempts:
+        log.info("尝试连接方式: %s", label)
+        s = create_session(proxy_url)
+        try:
+            data = get_json(s.get(f"{BASE_URL}/api/status", timeout=25))
+            if data and data.get("success"):
+                log.info("✅ 连接可用：%s（已绕过 WAF）", label)
+                return s
+        except Exception as e:
+            log.warning("连接 [%s] 异常: %s", label, e)
+        log.warning("❌ 连接 [%s] 不可用，尝试下一个", label)
+    return None
+
+
+def do_login(session: requests.Session) -> dict:
+    """登录（= 触发签到），返回用户 data（含 checked_in / access_token / id）"""
+    payload = {"username": USERNAME, "password": PASSWORD}
     try:
-        resp = session.get(url, timeout=15)
-        data = parse_json(resp, "GET /api/user/self")
-        return data.get("success", False)
-    except Exception as e:
-        log.error("校验访问令牌异常: %s", e)
-        return False
-
-
-def get_username(session: requests.Session) -> str:
-    """获取当前登录用户名（用于通知展示）"""
-    url = f"{BASE_URL}/api/user/self"
-    try:
-        resp = session.get(url, timeout=15)
-        data = resp.json()
-        if data.get("success"):
-            return data.get("data", {}).get("username", "") or "user"
-    except Exception:
-        pass
-    return "user"
-
-
-def get_checkin_status(session: requests.Session) -> dict:
-    """查询签到状态，返回 data 字典"""
-    url = f"{BASE_URL}/api/user/checkin"
-    try:
-        resp = session.get(url, timeout=15)
-        data = parse_json(resp, "GET /api/user/checkin")
-        if data.get("success"):
-            return data.get("data", {})
-        log.warning("查询签到状态失败: %s", data.get("message", ""))
-        return {}
-    except requests.RequestException as e:
-        log.error("查询签到状态异常: %s", e)
-        return {}
-
-
-def do_checkin(session: requests.Session) -> dict:
-    """执行签到，返回签到结果 data 字典"""
-    url = f"{BASE_URL}/api/user/checkin"
-    try:
-        resp = session.post(url, timeout=15)
-        data = parse_json(resp, "POST /api/user/checkin")
-
-        msg = data.get("message", "")
-        if not data.get("success"):
-            if "今日已签到" in msg:
-                log.info("执行签到返回: 今日已签到（可能并发重复）")
-                return {"already_checked_in": True}
-            log.warning("签到失败: %s", msg)
+        data = get_json(session.post(f"{BASE_URL}/api/user/login", json=payload, timeout=25))
+        if not data:
             return {}
-        log.info("签到成功！")
-        return data.get("data", {})
+        if data.get("success"):
+            log.info("登录成功: %s", mask(USERNAME))
+            return data.get("data", {})
+        log.error("登录失败: %s", data.get("message", "未知错误"))
+        return {}
     except requests.RequestException as e:
-        log.error("签到请求异常: %s", e)
+        log.error("登录请求异常: %s", e)
         return {}
 
 
-def get_user_quota(session: requests.Session) -> int:
-    """获取用户剩余 quota"""
-    url = f"{BASE_URL}/api/user/self"
+def get_quota(session: requests.Session, access_token: str, user_id) -> int:
+    """用登录得到的 access_token 查询最新余额 quota"""
     try:
-        resp = session.get(url, timeout=15)
-        data = resp.json()
-        if data.get("success"):
-            quota = data.get("data", {}).get("quota", 0)
-            log.info("当前 quota: %s (≈ $%.2f)", quota, quota_to_usd(quota))
-            return quota
-        log.warning("获取余额失败: %s", data.get("message", ""))
-        return 0
+        headers = {"Authorization": access_token, "New-API-User": str(user_id)}
+        data = get_json(session.get(f"{BASE_URL}/api/user/self", headers=headers, timeout=25))
+        if data and data.get("success"):
+            return data.get("data", {}).get("quota", 0)
     except requests.RequestException as e:
-        log.error("获取余额异常: %s", e)
-        return 0
+        log.error("查询余额异常: %s", e)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -192,64 +156,44 @@ def get_user_quota(session: requests.Session) -> int:
 def main():
     log.info("=" * 48)
     log.info("AgentRouter 每日签到脚本启动")
-    log.info("目标站点: %s", BASE_URL)
+    log.info("签到用户: %s", mask(USERNAME))
 
-    # 0. 校验必填配置
-    if not ACCESS_TOKEN:
-        log.error("未配置 AGENTROUTER_ACCESS_TOKEN，脚本退出")
-        sys.exit(1)
-    if not USER_ID:
-        log.error("未配置 AGENTROUTER_USER_ID，脚本退出")
+    if not USERNAME or not PASSWORD:
+        log.error("未配置 AGENTROUTER_USERNAME / AGENTROUTER_PASSWORD，脚本退出")
         sys.exit(1)
 
-    # 1. 创建带令牌的 session
-    session = create_session()
-
-    # 2. 校验令牌有效性
-    log.info("校验访问令牌...")
-    if not is_token_valid(session):
-        log.error("访问令牌无效或已失效，请在站点重新生成 AGENTROUTER_ACCESS_TOKEN")
-        sys.exit(1)
-    log.info("访问令牌有效")
-
-    username = get_username(session)
-
-    # 3. 查询今日签到状态
-    log.info("查询签到状态...")
-    checkin_data = get_checkin_status(session)
-    if not checkin_data:
-        log.error("无法获取签到状态，脚本退出")
+    # 1. 选出能绕过 WAF 的连接
+    session = build_working_session()
+    if session is None:
+        log.error("所有连接方式均无法绕过 WAF，请检查 SOCKS5_PROXY，脚本退出")
         sys.exit(1)
 
-    stats = checkin_data.get("stats", {})
-    checked_in_today = stats.get("checked_in_today", False)
+    # 2. 登录触发签到
+    log.info("登录中（登录即触发每日签到）...")
+    user = do_login(session)
+    if not user:
+        log.error("登录失败，无法签到，脚本退出")
+        sys.exit(1)
 
-    # 4. 构建通知数据
-    notify_data = {
-        "username": username,
-        "date": bjt_date_str(),
-        "checked_in": checked_in_today,
-        "reward_usd": 0.0,
-        "balance_usd": 0.0,
-    }
-
-    if checked_in_today:
-        log.info("✅ 今日已签到")
+    new_checkin = bool(user.get("checked_in"))  # True=本次触发了新签到
+    if new_checkin:
+        log.info("🎉 签到成功，新增额度已到账")
     else:
-        log.info("⏳ 今日未签到，执行签到...")
-        result = do_checkin(session)
-        if result.get("already_checked_in"):
-            notify_data["checked_in"] = True
-        else:
-            reward_quota = result.get("quota_awarded", 0)
-            notify_data["reward_usd"] = round(quota_to_usd(reward_quota), 2)
-            log.info("获得奖励 quota: %s (≈ $%.2f)", reward_quota, notify_data["reward_usd"])
+        log.info("✅ 今日已签到")
 
-    # 5. 获取最新余额
-    quota = get_user_quota(session)
-    notify_data["balance_usd"] = round(quota_to_usd(quota), 2)
+    # 3. 查询最新余额（登录响应中的 quota 可能尚未刷新）
+    quota = get_quota(session, user.get("access_token", ""), user.get("id", ""))
+    balance_usd = round(quota_to_usd(quota), 2)
+    log.info("当前余额: $%.2f", balance_usd)
 
-    # 6. 发送 TG 通知
+    # 4. 发送 TG 通知
+    notify_data = {
+        "username": mask(user.get("username") or USERNAME),
+        "date": bjt_date_str(),
+        "checked_in": not new_checkin,  # notify: True=今日已签到, False=新签到
+        "reward_usd": 0.0,
+        "balance_usd": balance_usd,
+    }
     try:
         from notify import send_tg_notification  # type: ignore
         send_tg_notification(notify_data)
