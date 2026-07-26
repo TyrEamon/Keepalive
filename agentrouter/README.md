@@ -41,7 +41,7 @@
 
 ## 三、签到逻辑
 
-1. 用 `AGENTROUTER_ACCESS_TOKEN` 作为 `Authorization: Bearer` 头，`AGENTROUTER_USER_ID` 作为 `New-Api-User` 头
+1. 用 `AGENTROUTER_ACCESS_TOKEN` 作为 `Authorization` 头，`AGENTROUTER_USER_ID` 作为 `New-Api-User` 头
 2. 校验令牌有效性（`GET /api/user/self`）
 3. 查询签到状态（`GET /api/user/checkin`）
 4. 未签到则执行签到（`POST /api/user/checkin`）

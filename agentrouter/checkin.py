@@ -6,6 +6,7 @@ AgentRouter 每日签到脚本（GitHub Actions 专用）
 
 说明：agentrouter.org 使用 GitHub OAuth 登录，无法用账号密码自动登录，
 因此改用站点「个人设置 → 系统访问令牌」生成的 Access Token 调用管理 API。
+注意：New-API 管理接口的 Authorization 头需直接放 token，【不能】加 "Bearer " 前缀。
 """
 
 import os
@@ -20,7 +21,7 @@ import requests
 BASE_URL = os.getenv("AGENTROUTER_BASE_URL") or "https://agentrouter.org"
 # 系统访问令牌（个人设置中生成，长期有效）
 ACCESS_TOKEN = os.getenv("AGENTROUTER_ACCESS_TOKEN") or ""
-# 用户数字 ID（管理 API 需要的 New-Api-User 头）
+# 用户数字 ID（管理 API 需要的 New-API-User 头）
 USER_ID = os.getenv("AGENTROUTER_USER_ID") or ""
 
 # New-API 配额 → 美元换算：1 USD = 500000 quota（如与实际不符可调整此值）
@@ -67,10 +68,8 @@ def create_session() -> requests.Session:
             "Chrome/125.0.0.0 Safari/537.36"
         ),
         "Accept": "application/json, text/plain, */*",
-        # 系统访问令牌：New-API 管理 API 通过 Authorization 头鉴权
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        # 管理 API 需要 New-Api-User 头标识当前用户
-        "New-Api-User": USER_ID,
+        "Authorization": ACCESS_TOKEN,
+        "New-API-User": USER_ID,
     })
     return session
 
