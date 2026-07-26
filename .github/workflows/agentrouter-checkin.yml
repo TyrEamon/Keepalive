@@ -1,0 +1,57 @@
+name: AgentRouter 每日签到
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 每天 UTC 02:00 = 北京时间 10:00
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 📦 安装依赖
+        working-directory: ./agentrouter
+        run: pip install -r requirements.txt
+
+      - name: ✅ 执行签到
+        id: checkin
+        working-directory: ./agentrouter
+        env:
+          AGENTROUTER_BASE_URL: ${{ vars.AGENTROUTER_BASE_URL }}
+          AGENTROUTER_USER_ID: ${{ vars.AGENTROUTER_USER_ID }}
+          AGENTROUTER_USERNAME: ${{ vars.AGENTROUTER_USERNAME }}
+          AGENTROUTER_PASSWORD: ${{ vars.AGENTROUTER_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          AGENTROUTER_SESSION_COOKIE: ${{ vars.AGENTROUTER_SESSION_COOKIE }}
+        run: python checkin.py
+
+      - name: 💾 将 session 写回 GitHub Actions Variables
+        if: always()
+        working-directory: ./agentrouter
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          if [ -f session.cookie.b64 ]; then
+            SESSION_VALUE=$(cat session.cookie.b64)
+            echo "写入 session 到 AGENTROUTER_SESSION_COOKIE 变量..."
+            gh variable set AGENTROUTER_SESSION_COOKIE \
+              --body "$SESSION_VALUE" \
+              --repo ${{ github.repository }}
+            echo "✅ 写入成功"
+            rm -f session.cookie.b64
+          else
+            echo "⏭️ 无 session.b64 文件，跳过写入"
+          fi
