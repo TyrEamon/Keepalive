@@ -29,8 +29,9 @@ jobs:
         working-directory: ./agentrouter
         env:
           AGENTROUTER_BASE_URL: ${{ vars.AGENTROUTER_BASE_URL }}
-          AGENTROUTER_USER_ID: ${{ vars.AGENTROUTER_USER_ID }}
-          AGENTROUTER_ACCESS_TOKEN: ${{ vars.AGENTROUTER_ACCESS_TOKEN }}
+          AGENTROUTER_USERNAME: ${{ vars.AGENTROUTER_USERNAME }}
+          AGENTROUTER_PASSWORD: ${{ vars.AGENTROUTER_PASSWORD }}
+          SOCKS5_PROXY: ${{ vars.SOCKS5_PROXY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python checkin.py
