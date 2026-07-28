@@ -11,7 +11,7 @@
  */
 import { readCookieFromEnv, validateCookie, saveCookieToVariable } from './cookie.js';
 import { doLogin } from './login.js';
-import { fetchCredits, fetchCreditsWithCookie } from './credits.js';
+import { fetchCredits, fetchCreditsWithCookieViaBrowser } from './credits.js';
 import { sendNotify } from './notify.js';
 
 async function main() {
@@ -73,7 +73,7 @@ async function main() {
           console.log('[login] 浏览器已关闭');
         } catch (_) {}
       } else {
-        credit = await fetchCreditsWithCookie(cookieStr);
+        credit = await fetchCreditsWithCookieViaBrowser(cookieStr);
       }
 
       // 保存 Cookie 到 GitHub Variable
@@ -89,8 +89,8 @@ async function main() {
     }
   } else {
     loginSuccess = true;
-    // Cookie 有效，直接用 fetch 查积分
-    credit = await fetchCreditsWithCookie(cookieStr);
+    // Cookie 有效，用浏览器查积分（确保 JS 渲染后的数据）
+    credit = await fetchCreditsWithCookieViaBrowser(cookieStr);
   }
 
   // TG 通知
