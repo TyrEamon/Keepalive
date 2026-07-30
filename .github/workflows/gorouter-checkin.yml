@@ -2,17 +2,24 @@ name: GoRouter 每日签到
 
 on:
   schedule:
+    # UTC 16:20
+    # 北京时间次日 00:20，日本时间次日 01:20
     - cron: "20 16 * * *"
+
+  # 支持在 Actions 页面手动运行
   workflow_dispatch:
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./gorouter
+
     permissions:
       contents: read
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./gorouter
 
     steps:
       - name: 📥 检出代码
@@ -23,33 +30,77 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: gorouter/requirements.txt
 
       - name: 📦 安装依赖
         run: pip install -r requirements.txt
 
+      - name: 🔍 检查配置
+        env:
+          GOROUTER_TOKEN: ${{ secrets.GOROUTER_TOKEN }}
+          GOROUTER_USER_ID: ${{ secrets.GOROUTER_USER_ID }}
+          GOROUTER_SESSION_COOKIE: ${{ secrets.GOROUTER_SESSION_COOKIE }}
+        run: |
+          if [[ -n "${GOROUTER_TOKEN:-}" ]]; then
+            echo "✅ GOROUTER_TOKEN 已读取"
+          else
+            echo "❌ GOROUTER_TOKEN 未读取"
+          fi
+
+          if [[ -n "${GOROUTER_USER_ID:-}" ]]; then
+            echo "✅ GOROUTER_USER_ID 已读取"
+          else
+            echo "❌ GOROUTER_USER_ID 未读取"
+          fi
+
+          if [[ -n "${GOROUTER_SESSION_COOKIE:-}" ]]; then
+            echo "✅ GOROUTER_SESSION_COOKIE 已读取"
+          else
+            echo "❌ GOROUTER_SESSION_COOKIE 未读取"
+          fi
+
       - name: ✅ 执行签到
         id: checkin
         env:
-          GOROUTER_TOKEN: ${{ vars.GOROUTER_TOKEN }}
-          GOROUTER_USER_ID: ${{ vars.GOROUTER_USER_ID }}
-          GOROUTER_SESSION_COOKIE: ${{ vars.GOROUTER_SESSION_COOKIE }}
+          GOROUTER_TOKEN: ${{ secrets.GOROUTER_TOKEN }}
+          GOROUTER_USER_ID: ${{ secrets.GOROUTER_USER_ID }}
+          GOROUTER_SESSION_COOKIE: ${{ secrets.GOROUTER_SESSION_COOKIE }}
+
+          # Telegram 通知，可不配置
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python checkin.py
 
-      - name: 💾 将 session 写回 GitHub Actions Variables
+      - name: 💾 更新 Session Secret
         if: always()
         env:
+          # 这是用于修改仓库 Secret 的 GitHub PAT
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          if [ -f session.cookie.b64 ]; then
-            SESSION_VALUE=$(cat session.cookie.b64)
-            echo "写入 session 到 GOROUTER_SESSION_COOKIE 变量..."
-            gh variable set GOROUTER_SESSION_COOKIE \
-              --body "$SESSION_VALUE" \
-              --repo ${{ github.repository }}
-            echo "✅ 写入成功"
-            rm -f session.cookie.b64
-          else
-            echo "⏭️ 无 session.cookie.b64 文件，跳过写入"
+          if [[ ! -f session.cookie.b64 ]]; then
+            echo "⏭️ 没有生成 session.cookie.b64，跳过更新"
+            exit 0
           fi
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "⚠️ 未配置 GH_TOKEN，无法自动更新 Session Secret"
+            rm -f session.cookie.b64
+            exit 0
+          fi
+
+          SESSION_VALUE="$(cat session.cookie.b64)"
+
+          if [[ -z "$SESSION_VALUE" ]]; then
+            echo "⚠️ session.cookie.b64 内容为空，跳过更新"
+            rm -f session.cookie.b64
+            exit 0
+          fi
+
+          echo "正在更新 GOROUTER_SESSION_COOKIE Secret……"
+
+          gh secret set GOROUTER_SESSION_COOKIE \
+            --body "$SESSION_VALUE" \
+            --repo "${{ github.repository }}"
+
+          echo "✅ GOROUTER_SESSION_COOKIE Secret 更新成功"
+          rm -f session.cookie.b64
