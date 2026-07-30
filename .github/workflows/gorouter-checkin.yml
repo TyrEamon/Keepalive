@@ -1,9 +1,10 @@
-name: GoRouter 每日签到
+name: GoRouter 多账号每日签到
 
 on:
   schedule:
     # UTC 16:20
-    # 北京时间次日 00:20，日本时间次日 01:20
+    # 北京时间次日 00:20
+    # 日本时间次日 01:20
     - cron: "20 16 * * *"
 
   # 支持在 Actions 页面手动运行
@@ -35,72 +36,57 @@ jobs:
       - name: 📦 安装依赖
         run: pip install -r requirements.txt
 
-      - name: 🔍 检查配置
+      - name: 🔍 检查多账号配置
         env:
-          GOROUTER_TOKEN: ${{ secrets.GOROUTER_TOKEN }}
-          GOROUTER_USER_ID: ${{ secrets.GOROUTER_USER_ID }}
-          GOROUTER_SESSION_COOKIE: ${{ secrets.GOROUTER_SESSION_COOKIE }}
+          GOROUTER_ACCOUNTS_JSON: ${{ secrets.GOROUTER_ACCOUNTS_JSON }}
         run: |
-          if [[ -n "${GOROUTER_TOKEN:-}" ]]; then
-            echo "✅ GOROUTER_TOKEN 已读取"
+          if [[ -n "${GOROUTER_ACCOUNTS_JSON:-}" ]]; then
+            echo "✅ GOROUTER_ACCOUNTS_JSON 已读取"
           else
-            echo "❌ GOROUTER_TOKEN 未读取"
+            echo "❌ GOROUTER_ACCOUNTS_JSON 未读取"
+            exit 1
           fi
 
-          if [[ -n "${GOROUTER_USER_ID:-}" ]]; then
-            echo "✅ GOROUTER_USER_ID 已读取"
-          else
-            echo "❌ GOROUTER_USER_ID 未读取"
-          fi
-
-          if [[ -n "${GOROUTER_SESSION_COOKIE:-}" ]]; then
-            echo "✅ GOROUTER_SESSION_COOKIE 已读取"
-          else
-            echo "❌ GOROUTER_SESSION_COOKIE 未读取"
-          fi
-
-      - name: ✅ 执行签到
-        id: checkin
+      - name: ✅ 执行多账号签到
         env:
-          GOROUTER_TOKEN: ${{ secrets.GOROUTER_TOKEN }}
-          GOROUTER_USER_ID: ${{ secrets.GOROUTER_USER_ID }}
-          GOROUTER_SESSION_COOKIE: ${{ secrets.GOROUTER_SESSION_COOKIE }}
+          GOROUTER_ACCOUNTS_JSON: ${{ secrets.GOROUTER_ACCOUNTS_JSON }}
+
+          # 每个账号之间等待的秒数
+          CHECKIN_INTERVAL_SECONDS: "1.5"
 
           # Telegram 通知，可不配置
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python checkin.py
 
-      - name: 💾 更新 Session Secret
+      - name: 💾 可选更新多账号 Secret
         if: always()
+
+        # 即使 GH_TOKEN 权限不足，也不让整个签到任务变红
+        continue-on-error: true
+
         env:
-          # 这是用于修改仓库 Secret 的 GitHub PAT
+          # Fine-grained PAT
+          # 需要当前仓库 Secrets: Read and write
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
         run: |
-          if [[ ! -f session.cookie.b64 ]]; then
-            echo "⏭️ 没有生成 session.cookie.b64，跳过更新"
+          if [[ ! -f accounts.updated.json ]]; then
+            echo "⏭️ 没有生成 accounts.updated.json，跳过写回"
             exit 0
           fi
 
           if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "⚠️ 未配置 GH_TOKEN，无法自动更新 Session Secret"
-            rm -f session.cookie.b64
+            echo "⚠️ 未配置 GH_TOKEN，跳过自动写回"
+            rm -f accounts.updated.json
             exit 0
           fi
 
-          SESSION_VALUE="$(cat session.cookie.b64)"
+          echo "正在更新 GOROUTER_ACCOUNTS_JSON Secret……"
 
-          if [[ -z "$SESSION_VALUE" ]]; then
-            echo "⚠️ session.cookie.b64 内容为空，跳过更新"
-            rm -f session.cookie.b64
-            exit 0
-          fi
-
-          echo "正在更新 GOROUTER_SESSION_COOKIE Secret……"
-
-          gh secret set GOROUTER_SESSION_COOKIE \
-            --body "$SESSION_VALUE" \
+          gh secret set GOROUTER_ACCOUNTS_JSON \
+            --body "$(cat accounts.updated.json)" \
             --repo "${{ github.repository }}"
 
-          echo "✅ GOROUTER_SESSION_COOKIE Secret 更新成功"
-          rm -f session.cookie.b64
+          echo "✅ GOROUTER_ACCOUNTS_JSON Secret 更新成功"
+          rm -f accounts.updated.json
