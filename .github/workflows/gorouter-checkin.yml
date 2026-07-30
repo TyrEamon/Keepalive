@@ -1,0 +1,55 @@
+name: GoRouter 每日签到
+
+on:
+  schedule:
+    - cron: "20 16 * * *"
+  workflow_dispatch:
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./gorouter
+    permissions:
+      contents: read
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 📦 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: ✅ 执行签到
+        id: checkin
+        env:
+          GOROUTER_TOKEN: ${{ vars.GOROUTER_TOKEN }}
+          GOROUTER_USER_ID: ${{ vars.GOROUTER_USER_ID }}
+          GOROUTER_SESSION_COOKIE: ${{ vars.GOROUTER_SESSION_COOKIE }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python checkin.py
+
+      - name: 💾 将 session 写回 GitHub Actions Variables
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          if [ -f session.cookie.b64 ]; then
+            SESSION_VALUE=$(cat session.cookie.b64)
+            echo "写入 session 到 GOROUTER_SESSION_COOKIE 变量..."
+            gh variable set GOROUTER_SESSION_COOKIE \
+              --body "$SESSION_VALUE" \
+              --repo ${{ github.repository }}
+            echo "✅ 写入成功"
+            rm -f session.cookie.b64
+          else
+            echo "⏭️ 无 session.cookie.b64 文件，跳过写入"
+          fi
