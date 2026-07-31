@@ -11,6 +11,40 @@ iamhc
 
 ## 环境变量
 
+### IAMHC_ACCOUNTS_JSON
+
+```bash
+[
+  {
+    "name": "主账号",
+    "base_url": "https://api.hcnsec.cn",
+    "user_id": "64195",
+    "username": "第一个账号用户名",
+    "password": "第一个账号密码",
+    "session": "第一个账号原始session值"
+  },
+  {
+    "name": "账号2",
+    "base_url": "https://api.hcnsec.cn",
+    "user_id": "第二个账号ID",
+    "username": "第二个账号用户名",
+    "password": "第二个账号密码",
+    "session": "第二个账号原始session值"
+  },
+  {
+    "name": "账号3",
+    "base_url": "https://api.hcnsec.cn",
+    "user_id": "第三个账号ID",
+    "username": "第三个账号用户名",
+    "password": "第三个账号密码",
+    "session": "第三个账号原始session值",
+    "enabled": false
+  }
+]
+```
+
+
+
 ### action Variables
 
 | Variable 名称 | 值 | 说明 |
