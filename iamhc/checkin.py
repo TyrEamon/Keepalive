@@ -1,288 +1,531 @@
 #!/usr/bin/env python3
 """
-IAMHC 每日签到脚本（GitHub Actions 专用）
-自动登录、查询签到状态、执行签到、获取余额，通过 TG 发送通知
+IAMHC / New-API 多账号每日签到（GitHub Actions）
+
+配置：
+  IAMHC_ACCOUNTS_JSON：JSON 数组，放在 GitHub Actions Secret 中。
+
+每个账号支持：
+  name       账号备注，可选
+  base_url   站点地址，可选，默认读取 IAMHC_BASE_URL
+  user_id    New-Api-User，必填
+  username   登录用户名，Session 失效后自动登录时需要
+  password   登录密码，Session 失效后自动登录时需要
+  session    原始 session Cookie 值，可选，支持带 session= 前缀
+  enabled    false 时跳过，可选
 """
 
+from __future__ import annotations
+
+import base64
+import json
+import logging
 import os
 import sys
-import json
-import base64
-import logging
-from datetime import datetime, timezone, timedelta
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from urllib.parse import urlparse
+
 import requests
 
-# ---------------------------------------------------------------------------
-# 配置（从环境变量读取）
-# ---------------------------------------------------------------------------
-BASE_URL = os.getenv("IAMHC_BASE_URL") or "https://api.iamhc.cn"
-USERNAME = os.getenv("IAMHC_USERNAME") or ""
-PASSWORD = os.getenv("IAMHC_PASSWORD") or ""
-USER_ID = os.getenv("IAMHC_USER_ID") or ""
 
-# IAMHC 配额 → 美元换算：1 USD = 500000 quota
-QUOTA_PER_UNIT = 500000
-
-# 北京时间时区
+DEFAULT_BASE_URL = (os.getenv("IAMHC_BASE_URL") or "https://api.hcnsec.cn").rstrip("/")
+QUOTA_PER_USD = 500_000
+REQUEST_TIMEOUT = 20
 BJT = timezone(timedelta(hours=8))
 
-# 日志
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("checkin")
-
-
-# ---------------------------------------------------------------------------
-# 工具函数
-# ---------------------------------------------------------------------------
-
-def mask_username(name: str) -> str:
-    """用户名脱敏：显示前 4 位 + ●●●●●"""
-    if not name:
-        return "●●●●●"
-    return (name[:4] + "●●●●●") if len(name) > 4 else (name + "●●●●●")
-
-
-def quota_to_usd(quota: int) -> float:
-    """将 quota 转换为美元"""
-    return quota / QUOTA_PER_UNIT
+log = logging.getLogger("iamhc-checkin")
 
 
 def bjt_date_str() -> str:
-    """北京时间日期字符串，如 '2026年07月09日'"""
     now = datetime.now(BJT)
     return f"{now.year}年{now.month:02d}月{now.day:02d}日"
 
 
-# ---------------------------------------------------------------------------
-# Session 序列化（JSON → base64，适配 GitHub Actions Variables）
-# ---------------------------------------------------------------------------
-
-def session_to_b64(session: requests.Session) -> str:
-    """将 session cookies 序列化为 base64 字符串"""
-    cookies_list = []
-    for cookie in session.cookies:
-        cookies_list.append({
-            "name": cookie.name,
-            "value": cookie.value,
-            "domain": cookie.domain,
-            "path": cookie.path,
-            "secure": cookie.secure,
-            "expires": cookie.expires,
-        })
-    return base64.b64encode(json.dumps(cookies_list).encode()).decode()
-
-
-def b64_to_session(session: requests.Session, encoded: str) -> bool:
-    """从 base64 字符串恢复 session cookies"""
+def quota_to_usd(quota: Any) -> float:
     try:
-        cookies_list = json.loads(base64.b64decode(encoded))
-        for c in cookies_list:
-            session.cookies.set(
-                c["name"], c["value"],
-                domain=c.get("domain"),
-                path=c.get("path", "/"),
-                secure=c.get("secure", False),
+        return round(float(quota or 0) / QUOTA_PER_USD, 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def mask_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "未命名"
+    if len(text) <= 2:
+        return text[0] + "***"
+    if len(text) <= 4:
+        return text[:2] + "***"
+    return text[:4] + "*****"
+
+
+def normalize_session(value: Any) -> str:
+    session_value = str(value or "").strip()
+    if session_value.lower().startswith("session="):
+        session_value = session_value.split("=", 1)[1].strip()
+    return session_value
+
+
+def decode_legacy_session_b64(encoded: str) -> list[dict[str, Any]]:
+    """兼容旧版 IAMHC_SESSION_COOKIE 的 Cookie 列表 Base64。"""
+    raw = base64.b64decode(encoded, validate=True)
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("旧版 Session Base64 解码后不是数组")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def load_accounts() -> tuple[list[dict[str, Any]], list[Any]]:
+    raw = (os.getenv("IAMHC_ACCOUNTS_JSON") or "").strip()
+    if not raw:
+        raise ValueError("未配置 IAMHC_ACCOUNTS_JSON")
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"IAMHC_ACCOUNTS_JSON 格式错误：第 {exc.lineno} 行第 {exc.colno} 列"
+        ) from exc
+
+    if isinstance(payload, dict):
+        payload = payload.get("accounts")
+
+    if not isinstance(payload, list):
+        raise ValueError("IAMHC_ACCOUNTS_JSON 顶层必须是数组 []")
+
+    # 保留原始列表，自动写回 Session 时不会丢掉 disabled 账号或自定义字段。
+    original_accounts: list[Any] = [
+        dict(item) if isinstance(item, dict) else item
+        for item in payload
+    ]
+
+    accounts: list[dict[str, Any]] = []
+    for index, item in enumerate(payload, start=1):
+        if not isinstance(item, dict):
+            log.warning("跳过第 %d 项：账号配置不是对象", index)
+            continue
+
+        if item.get("enabled", True) is False:
+            log.info("跳过已禁用账号：%s", item.get("name") or f"账号{index}")
+            continue
+
+        account = dict(item)
+        account["_source_index"] = index - 1
+        account["name"] = str(item.get("name") or f"账号{index}").strip()
+        account["base_url"] = str(item.get("base_url") or DEFAULT_BASE_URL).strip().rstrip("/")
+        account["user_id"] = str(item.get("user_id") or "").strip()
+        account["username"] = str(item.get("username") or "").strip()
+        account["password"] = str(item.get("password") or "")
+        account["session"] = normalize_session(item.get("session"))
+        account["session_b64"] = str(item.get("session_b64") or "").strip()
+
+        parsed = urlparse(account["base_url"])
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            log.warning("跳过 %s：base_url 无效", account["name"])
+            continue
+
+        if not account["user_id"]:
+            log.warning("跳过 %s：缺少 user_id", account["name"])
+            continue
+
+        has_session = bool(account["session"] or account["session_b64"])
+        has_login = bool(account["username"] and account["password"])
+        if not has_session and not has_login:
+            log.warning(
+                "跳过 %s：至少需要 session，或 username + password",
+                account["name"],
             )
-        return True
-    except Exception as e:
-        log.warning("解析 SESSION_COOKIE 失败: %s", e)
-        return False
+            continue
 
+        accounts.append(account)
 
-# ---------------------------------------------------------------------------
-# API 调用
-# ---------------------------------------------------------------------------
+    if not accounts:
+        raise ValueError("没有可运行的 IAMHC 账号")
 
-def create_session() -> requests.Session:
-    """创建预配置的 requests Session"""
+    return accounts, original_accounts
+
+def create_http_session(account: dict[str, Any]) -> requests.Session:
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-    })
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/150.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+            "Referer": f"{account['base_url']}/profile",
+        }
+    )
+
+    if account.get("session_b64"):
+        try:
+            for cookie in decode_legacy_session_b64(account["session_b64"]):
+                name = str(cookie.get("name") or "").strip()
+                value = str(cookie.get("value") or "")
+                if not name:
+                    continue
+                session.cookies.set(
+                    name,
+                    value,
+                    domain=cookie.get("domain"),
+                    path=cookie.get("path") or "/",
+                    secure=bool(cookie.get("secure", True)),
+                )
+        except Exception as exc:
+            log.warning("%s：旧版 Session Base64 解析失败：%s", account["name"], exc)
+
+    if account.get("session"):
+        host = urlparse(account["base_url"]).hostname
+        session.cookies.set(
+            "session",
+            account["session"],
+            domain=host,
+            path="/",
+            secure=account["base_url"].startswith("https://"),
+        )
+
     return session
 
 
-def _set_auth_header(session: requests.Session):
-    """为管理 API 请求添加 New-Api-User 头"""
-    session.headers["New-Api-User"] = USER_ID
+def set_user_header(session: requests.Session, user_id: str) -> None:
+    session.headers["New-Api-User"] = user_id
 
 
-def api_login(session: requests.Session) -> bool:
-    """登录并获取 session cookie"""
-    url = f"{BASE_URL}/api/user/login"
-    payload = {"username": USERNAME, "password": PASSWORD}
+def clear_user_header(session: requests.Session) -> None:
+    session.headers.pop("New-Api-User", None)
+
+
+def request_json(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    json_body: dict[str, Any] | None = None,
+) -> tuple[bool, dict[str, Any], str, int]:
     try:
-        resp = session.post(url, json=payload, timeout=30)
-        data = resp.json()
-        if data.get("success"):
-            log.info("登录成功: %s", mask_username(USERNAME))
-            return True
-        log.error("登录失败: %s", data.get("message", "未知错误"))
-        return False
-    except requests.RequestException as e:
-        log.error("登录请求异常: %s", e)
-        return False
+        response = session.request(
+            method,
+            url,
+            json=json_body,
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        return False, {}, f"请求异常：{exc}", 0
 
-
-def is_session_valid(session: requests.Session) -> bool:
-    """检查当前 session 是否仍然有效"""
-    _set_auth_header(session)
-    url = f"{BASE_URL}/api/user/self"
     try:
-        resp = session.get(url, timeout=15)
-        return resp.json().get("success", False)
-    except Exception:
-        return False
+        payload = response.json()
+    except ValueError:
+        text = (response.text or "").strip().replace("\n", " ")[:160]
+        return (
+            False,
+            {},
+            f"HTTP {response.status_code}，返回内容不是 JSON：{text}",
+            response.status_code,
+        )
+
+    if not isinstance(payload, dict):
+        return False, {}, f"HTTP {response.status_code}，返回格式异常", response.status_code
+
+    message = str(payload.get("message") or "").strip()
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = {}
+
+    if response.status_code >= 400 or not payload.get("success", False):
+        return (
+            False,
+            data,
+            message or f"HTTP {response.status_code}",
+            response.status_code,
+        )
+
+    return True, data, message, response.status_code
 
 
-def get_checkin_status(session: requests.Session) -> dict:
-    """查询签到状态，返回 data 字典"""
-    _set_auth_header(session)
-    url = f"{BASE_URL}/api/user/checkin"
-    try:
-        resp = session.get(url, timeout=15)
-        data = resp.json()
-        if data.get("success"):
-            return data.get("data", {})
-        log.warning("查询签到状态失败: %s", data.get("message", ""))
-        return {}
-    except requests.RequestException as e:
-        log.error("查询签到状态异常: %s", e)
-        return {}
+def get_user_info(
+    session: requests.Session,
+    account: dict[str, Any],
+) -> tuple[bool, dict[str, Any], str]:
+    set_user_header(session, account["user_id"])
+    ok, data, message, _ = request_json(
+        session,
+        "GET",
+        f"{account['base_url']}/api/user/self",
+    )
+    return ok, data, message
 
 
-def do_checkin(session: requests.Session) -> dict:
-    """执行签到，返回签到结果 data 字典"""
-    _set_auth_header(session)
-    url = f"{BASE_URL}/api/user/checkin"
-    try:
-        resp = session.post(url, timeout=15)
-        data = resp.json()
+def login(session: requests.Session, account: dict[str, Any]) -> tuple[bool, str]:
+    if not account.get("username") or not account.get("password"):
+        return False, "Session 无效，且未配置 username/password"
 
-        msg = data.get("message", "")
-        if not data.get("success"):
-            if "今日已签到" in msg:
-                log.info("执行签到返回: 今日已签到（可能并发重复）")
-                return {"already_checked_in": True}
-            log.warning("签到失败: %s", msg)
-            return {}
-        log.info("签到成功！")
-        return data.get("data", {})
-    except requests.RequestException as e:
-        log.error("签到请求异常: %s", e)
-        return {}
+    clear_user_header(session)
+    ok, _, message, _ = request_json(
+        session,
+        "POST",
+        f"{account['base_url']}/api/user/login",
+        json_body={
+            "username": account["username"],
+            "password": account["password"],
+        },
+    )
+    if not ok:
+        return False, message or "登录失败"
 
-
-def get_user_quota(session: requests.Session) -> int:
-    """获取用户剩余 quota"""
-    _set_auth_header(session)
-    url = f"{BASE_URL}/api/user/self"
-    try:
-        resp = session.get(url, timeout=15)
-        data = resp.json()
-        if data.get("success"):
-            quota = data.get("data", {}).get("quota", 0)
-            log.info("当前 quota: %s (≈ $%.2f)", quota, quota_to_usd(quota))
-            return quota
-        log.warning("获取余额失败: %s", data.get("message", ""))
-        return 0
-    except requests.RequestException as e:
-        log.error("获取余额异常: %s", e)
-        return 0
+    set_user_header(session, account["user_id"])
+    return True, "登录成功"
 
 
-# ---------------------------------------------------------------------------
-# 主流程
-# ---------------------------------------------------------------------------
+def get_checkin_status(
+    session: requests.Session,
+    account: dict[str, Any],
+) -> tuple[bool, dict[str, Any], str]:
+    set_user_header(session, account["user_id"])
+    ok, data, message, _ = request_json(
+        session,
+        "GET",
+        f"{account['base_url']}/api/user/checkin",
+    )
+    return ok, data, message
 
-def main():
-    log.info("=" * 48)
-    log.info("IAMHC 每日签到脚本启动")
-    log.info("目标站点: %s", BASE_URL)
-    log.info("签到用户: %s", mask_username(USERNAME))
 
-    # 1. 创建 session
-    session = create_session()
+def do_checkin(
+    session: requests.Session,
+    account: dict[str, Any],
+) -> tuple[bool, dict[str, Any], str]:
+    set_user_header(session, account["user_id"])
+    ok, data, message, _ = request_json(
+        session,
+        "POST",
+        f"{account['base_url']}/api/user/checkin",
+    )
+    if not ok and "今日已签到" in message:
+        return True, {"already_checked_in": True}, message
+    return ok, data, message
 
-    # 2. 尝试从 SESSION_COOKIE 变量恢复 session（仅 GitHub Actions 环境）
-    session_encoded = os.getenv("IAMHC_SESSION_COOKIE") or ""
-    session_valid = False
-    if session_encoded:
-        log.info("检测到 IAMHC_SESSION_COOKIE 变量，尝试恢复 session...")
-        if b64_to_session(session, session_encoded) and is_session_valid(session):
-            log.info("session 有效，跳过登录")
-            session_valid = True
-        else:
-            log.info("session 已失效，需要重新登录")
 
-    if not session_valid:
-        log.info("登录中...")
-        if not api_login(session):
-            log.error("登录失败，脚本退出")
-            sys.exit(1)
+def extract_session_cookie(session: requests.Session) -> str:
+    candidates = [cookie for cookie in session.cookies if cookie.name == "session"]
+    if not candidates:
+        return ""
+    return str(candidates[-1].value or "")
 
-    # 3. 查询今日签到状态
-    log.info("查询签到状态...")
-    checkin_data = get_checkin_status(session)
-    if not checkin_data:
-        log.error("无法获取签到状态，脚本退出")
-        sys.exit(1)
 
-    stats = checkin_data.get("stats", {})
-    checked_in_today = stats.get("checked_in_today", False)
+def run_account(
+    account: dict[str, Any],
+    index: int,
+    total: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    name = account["name"]
+    log.info("-" * 56)
+    log.info("[%d/%d] 处理账号：%s", index, total, name)
+    log.info("目标站点：%s", account["base_url"])
+    log.info("用户 ID：%s", account["user_id"])
 
-    # 4. 构建通知数据
-    notify_data = {
-        "username": mask_username(USERNAME),
-        "date": bjt_date_str(),
-        "checked_in": checked_in_today,
+    updated_account = dict(account)
+    result: dict[str, Any] = {
+        "name": name,
+        "base_url": account["base_url"],
+        "success": False,
+        "status": "failed",
+        "message": "",
+        "username": "",
         "reward_usd": 0.0,
         "balance_usd": 0.0,
     }
 
-    if checked_in_today:
-        log.info("✅ 今日已签到")
+    session = create_http_session(account)
+
+    ok, user_info, message = get_user_info(session, account)
+    if ok:
+        log.info("%s：Session 有效，跳过登录", name)
     else:
-        log.info("⏳ 今日未签到，执行签到...")
-        result = do_checkin(session)
-        if result.get("already_checked_in"):
-            notify_data["checked_in"] = True
+        log.info("%s：Session 不可用，尝试账号密码登录", name)
+        login_ok, login_message = login(session, account)
+        if not login_ok:
+            result["message"] = f"登录失败：{login_message}"
+            log.error("%s：%s", name, result["message"])
+            return result, updated_account
+
+        ok, user_info, message = get_user_info(session, account)
+        if not ok:
+            result["message"] = f"登录后验证失败：{message}"
+            log.error("%s：%s", name, result["message"])
+            return result, updated_account
+        log.info("%s：登录成功", name)
+
+    display_name = (
+        user_info.get("display_name")
+        or user_info.get("username")
+        or account.get("username")
+        or name
+    )
+    result["username"] = mask_text(display_name)
+    result["balance_usd"] = quota_to_usd(user_info.get("quota"))
+
+    ok, checkin_data, message = get_checkin_status(session, account)
+    if not ok:
+        result["message"] = f"查询签到状态失败：{message}"
+        log.error("%s：%s", name, result["message"])
+        new_session = extract_session_cookie(session)
+        if new_session:
+            updated_account["session"] = new_session
+            updated_account.pop("session_b64", None)
+        return result, updated_account
+
+    stats = checkin_data.get("stats")
+    if not isinstance(stats, dict):
+        stats = {}
+
+    if bool(stats.get("checked_in_today")):
+        result["success"] = True
+        result["status"] = "already"
+        result["message"] = "今日已签到"
+
+        records = stats.get("records")
+        if isinstance(records, list) and records:
+            last = records[-1]
+            if isinstance(last, dict):
+                result["reward_usd"] = quota_to_usd(last.get("quota_awarded"))
+
+        log.info("%s：✅ 今日已签到", name)
+    else:
+        ok, checkin_result, message = do_checkin(session, account)
+        if not ok:
+            result["message"] = f"签到失败：{message}"
+            log.error("%s：%s", name, result["message"])
+            new_session = extract_session_cookie(session)
+            if new_session:
+                updated_account["session"] = new_session
+                updated_account.pop("session_b64", None)
+            return result, updated_account
+
+        if checkin_result.get("already_checked_in"):
+            result["success"] = True
+            result["status"] = "already"
+            result["message"] = "今日已签到"
+            log.info("%s：✅ 接口返回今日已签到", name)
         else:
-            reward_quota = result.get("quota_awarded", 0)
-            notify_data["reward_usd"] = round(quota_to_usd(reward_quota), 2)
-            log.info("获得奖励 quota: %s (≈ $%.2f)", reward_quota, notify_data["reward_usd"])
+            result["success"] = True
+            result["status"] = "checked"
+            result["message"] = "签到成功"
+            result["reward_usd"] = quota_to_usd(checkin_result.get("quota_awarded"))
+            log.info("%s：🎉 签到成功，获得 $%.2f", name, result["reward_usd"])
 
-    # 5. 获取最新余额
-    quota = get_user_quota(session)
-    notify_data["balance_usd"] = round(quota_to_usd(quota), 2)
+    refreshed, refreshed_info, _ = get_user_info(session, account)
+    if refreshed:
+        result["balance_usd"] = quota_to_usd(refreshed_info.get("quota"))
 
-    # 6. 将 session 写回 Variables（生成 session.cookie.b64 供 workflow 的 gh variable set 使用）
-    session_b64 = session_to_b64(session)
-    with open("session.cookie.b64", "w") as f:
-        f.write(session_b64)
-    log.info("session 已编码写入 session.cookie.b64（供 gh variable set 写回 Variables）")
+    log.info("%s：当前余额 $%.2f", name, result["balance_usd"])
 
-    # 7. 发送 TG 通知
+    new_session = extract_session_cookie(session)
+    if new_session:
+        updated_account["session"] = new_session
+        updated_account.pop("session_b64", None)
+
+    return result, updated_account
+
+
+def save_updated_accounts(
+    original_accounts: list[Any],
+    updated_accounts: list[dict[str, Any]],
+) -> None:
+    """
+    只把刷新后的 session 合并回原始 JSON。
+
+    disabled 账号、账号顺序以及用户自行添加的字段都会保留。
+    """
+    merged: list[Any] = [
+        dict(item) if isinstance(item, dict) else item
+        for item in original_accounts
+    ]
+
+    for account in updated_accounts:
+        source_index = account.get("_source_index")
+        if not isinstance(source_index, int):
+            continue
+        if source_index < 0 or source_index >= len(merged):
+            continue
+        if not isinstance(merged[source_index], dict):
+            continue
+
+        new_session = normalize_session(account.get("session"))
+        if new_session:
+            merged[source_index]["session"] = new_session
+            merged[source_index].pop("session_b64", None)
+
+    with open("accounts.updated.json", "w", encoding="utf-8") as file:
+        json.dump(merged, file, ensure_ascii=False, indent=2)
+
+    log.info("已生成 accounts.updated.json，供工作流可选写回 Secret")
+
+def send_notification(results: list[dict[str, Any]]) -> None:
     try:
-        from notify import send_tg_notification  # type: ignore
-        send_tg_notification(notify_data)
-    except ImportError as e:
-        log.warning("无法导入 notify 模块: %s", e)
-    except Exception as e:
-        log.error("发送 TG 通知异常: %s", e)
+        from notify import send_tg_notification
 
-    log.info("签到流程完成")
-    log.info("=" * 48)
+        send_tg_notification(results, bjt_date_str())
+    except ImportError as exc:
+        log.warning("无法导入 notify 模块：%s", exc)
+    except Exception as exc:
+        log.error("发送 Telegram 通知异常：%s", exc)
+
+
+def main() -> int:
+    log.info("=" * 56)
+    log.info("IAMHC 多账号每日签到启动")
+
+    try:
+        accounts, original_accounts = load_accounts()
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 1
+
+    log.info("已载入 %d 个有效账号", len(accounts))
+
+    try:
+        interval = max(0.0, float(os.getenv("CHECKIN_INTERVAL_SECONDS", "1.5")))
+    except ValueError:
+        interval = 1.5
+
+    results: list[dict[str, Any]] = []
+    updated_accounts: list[dict[str, Any]] = []
+
+    for index, account in enumerate(accounts, start=1):
+        result, updated = run_account(account, index, len(accounts))
+        results.append(result)
+        updated_accounts.append(updated)
+
+        if index < len(accounts) and interval > 0:
+            time.sleep(interval)
+
+    save_updated_accounts(original_accounts, updated_accounts)
+    send_notification(results)
+
+    success_count = sum(1 for item in results if item.get("success"))
+    failed_count = len(results) - success_count
+
+    log.info("-" * 56)
+    log.info(
+        "签到完成：成功 %d，失败 %d，总计 %d",
+        success_count,
+        failed_count,
+        len(results),
+    )
+    log.info("=" * 56)
+
+    # 部分账号失败不让整次工作流变红；全部失败才返回 1。
+    return 0 if success_count > 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,79 +1,130 @@
 #!/usr/bin/env python3
 """
-TG 通知组件
-通过 Telegram Bot API 发送签到通知，作为独立模块被 checkin.py 调用
+IAMHC 多账号 Telegram 汇总通知。
 """
 
-import os
+from __future__ import annotations
+
 import logging
+import os
+from html import escape
+from typing import Any
 
 import requests
 
-log = logging.getLogger("notify")
 
-# TG 配置（从环境变量读取，为空则跳过通知）
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or ""
-TG_CHAT_ID = os.getenv("TG_CHAT_ID") or ""
+TG_BOT_TOKEN = (os.getenv("TG_BOT_TOKEN") or "").strip()
+TG_CHAT_ID = (os.getenv("TG_CHAT_ID") or "").strip()
+REQUEST_TIMEOUT = 20
+TELEGRAM_TEXT_LIMIT = 3900
+
+log = logging.getLogger("iamhc-notify")
 
 
-def send_tg_notification(data: dict) -> bool:
-    """
-    发送 TG 签到通知
+def money(value: Any) -> str:
+    try:
+        return f"${float(value or 0):,.2f}"
+    except (TypeError, ValueError):
+        return "$0.00"
 
-    参数 data 结构:
-    {
-        "username":   str,   # 脱敏后的用户名，如 "yuti*****"
-        "date":       str,   # 北京时间日期，如 "2026年07月09日"
-        "checked_in": bool,  # 今日是否已签到
-        "reward_usd": float, # 本次签到获得金额（仅未签到时有值）
-        "balance_usd": float,# 当前总余额
-    }
 
-    返回 True 表示发送成功，False 表示跳过或失败
-    """
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log.info("未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知")
-        return False
+def build_result_line(item: dict[str, Any]) -> str:
+    name = escape(str(item.get("name") or "未命名账号"))
+    balance = money(item.get("balance_usd"))
+    reward = money(item.get("reward_usd"))
+    success = bool(item.get("success"))
+    status = str(item.get("status") or "")
 
-    # 构建消息正文
-    if data.get("checked_in"):
-        # ── 今日已签到 ──
-        message = (
-            f"**IAMHC AI 签到通知**\n"
-            f"----------------\n"
-            f"📅 **日期**：{data['date']}\n"
-            f"👤 **用户**：{data['username']}\n"
-            f"✅ **签到**：今日已签到\n"
-            f"💰 **余额**：${data['balance_usd']:,.2f}"
-        )
-    else:
-        # ── 今日新签到 ──
-        message = (
-            f"**IAMHC AI 签到通知**\n"
-            f"----------------\n"
-            f"📅 **日期**：{data['date']}\n"
-            f"👤 **用户**：{data['username']}\n"
-            f"🎉 **签到**：获得奖励 ${data['reward_usd']:,.2f}\n"
-            f"💰 **余额**：${data['balance_usd']:,.2f}"
+    if success and status == "checked":
+        return (
+            f"🎉 <b>{name}</b>：签到成功，获得 {reward}\n"
+            f"　💰 余额：{balance}"
         )
 
+    if success and status == "already":
+        return (
+            f"✅ <b>{name}</b>：今日已签到\n"
+            f"　💰 余额：{balance}"
+        )
+
+    message = escape(str(item.get("message") or "未知错误"))
+    return f"❌ <b>{name}</b>：{message}"
+
+
+def split_messages(header: str, lines: list[str], footer: str) -> list[str]:
+    messages: list[str] = []
+    current = header
+
+    for line in lines:
+        candidate = f"{current}\n\n{line}"
+        if len(candidate) + len(footer) + 2 > TELEGRAM_TEXT_LIMIT:
+            messages.append(f"{current}\n\n{footer}")
+            current = f"{header}\n\n{line}"
+        else:
+            current = candidate
+
+    messages.append(f"{current}\n\n{footer}")
+    return messages
+
+
+def send_one_message(text: str) -> bool:
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TG_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
+        "text": text,
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
 
     try:
-        resp = requests.post(url, json=payload, timeout=15)
-        result = resp.json()
-        if result.get("ok"):
-            log.info("TG 通知发送成功")
-            return True
-        else:
-            log.warning("TG 通知发送失败: %s", result.get("description", "未知错误"))
-            return False
-    except requests.RequestException as e:
-        log.error("TG 通知请求异常: %s", e)
+        response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        result = response.json()
+    except requests.RequestException as exc:
+        log.error("Telegram 请求异常：%s", exc)
         return False
+    except ValueError:
+        log.error("Telegram 返回内容不是 JSON")
+        return False
+
+    if result.get("ok"):
+        return True
+
+    log.warning(
+        "Telegram 通知发送失败：%s",
+        result.get("description", "未知错误"),
+    )
+    return False
+
+
+def send_tg_notification(
+    results: list[dict[str, Any]],
+    date_text: str,
+) -> bool:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log.info("未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知")
+        return False
+
+    success_count = sum(1 for item in results if item.get("success"))
+    failed_count = len(results) - success_count
+
+    header = (
+        "<b>IAMHC AI 多账号签到</b>\n"
+        f"📅 {escape(date_text)}"
+    )
+    lines = [build_result_line(item) for item in results]
+    footer = (
+        "----------------\n"
+        f"成功：<b>{success_count}</b>　"
+        f"失败：<b>{failed_count}</b>　"
+        f"总计：<b>{len(results)}</b>"
+    )
+
+    all_ok = True
+    for message in split_messages(header, lines, footer):
+        if not send_one_message(message):
+            all_ok = False
+
+    if all_ok:
+        log.info("Telegram 汇总通知发送成功")
+
+    return all_ok
