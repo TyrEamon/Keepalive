@@ -360,6 +360,44 @@ TURNSTILE_INJECT = """
 """
 
 
+def _click_checkin_button(sb, name: str) -> bool:
+    """点击“每日签到”按钮，触发 Turnstile 安全验证弹窗。"""
+    selectors = [
+        'button:contains("每日签到")',
+        'button:contains("签到")',
+        'button:contains("Check-in")',
+        'button:contains("Check in")',
+    ]
+    for sel in selectors:
+        try:
+            if sb.is_element_visible(sel):
+                sb.click(sel)
+                log.info("[%s] 已点击签到按钮: %s", name, sel)
+                return True
+        except Exception:
+            continue
+
+    # JS 兜底：按可见文本查找并点击
+    clicked = sb.execute_script(r"""
+        var kws = ['每日签到', '签到', 'Check-in', 'Check in', 'Daily'];
+        var els = document.querySelectorAll(
+            'button, a, [role="button"], div[class*="checkin"], div[class*="check-in"]'
+        );
+        for (var i = 0; i < els.length; i++) {
+            var t = (els[i].innerText || els[i].textContent || '').trim();
+            if (!t || els[i].offsetParent === null) continue;
+            for (var k = 0; k < kws.length; k++) {
+                if (t.indexOf(kws[k]) >= 0) { els[i].click(); return t; }
+            }
+        }
+        return '';
+    """)
+    if clicked:
+        log.info("[%s] 已通过 JS 点击签到按钮: %s", name, clicked)
+        return True
+    return False
+
+
 def _get_turnstile_token_via_browser(account: dict[str, Any], name: str) -> str:
     """
     使用 seleniumbase UC 模式启动浏览器：
@@ -407,7 +445,7 @@ def _get_turnstile_token_via_browser(account: dict[str, Any], name: str) -> str:
                 "source": TURNSTILE_INJECT,
             })
 
-            # Step 4: 访问 dashboard
+            # Step 4: 访问 profile 页面
             profile_url = f"{BASE_URL}/profile"
             log.info("[%s] 正在打开 %s (UC 模式)...", name, profile_url)
             sb.uc_open_with_reconnect(profile_url, reconnect_time=4)
@@ -415,7 +453,14 @@ def _get_turnstile_token_via_browser(account: dict[str, Any], name: str) -> str:
 
             current_url = sb.get_current_url()
 
-            # Step 5: 检测 Turnstile 并以 CDP 点击方式解决
+            # Step 5: 点击“每日签到”按钮，触发 Turnstile 安全验证弹窗
+            #         （Turnstile widget 只在点击签到后弹出的 modal 里渲染）
+            if _click_checkin_button(sb, name):
+                sb.sleep(3)
+            else:
+                log.info("[%s] 未找到签到按钮，直接检测页面 Turnstile", name)
+
+            # Step 6: 检测 Turnstile 并以 CDP 点击方式解决
             page_src = sb.get_page_source().lower()
             has_ts = "turnstile" in page_src or "challenges.cloudflare.com" in page_src
 
