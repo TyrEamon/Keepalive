@@ -135,13 +135,16 @@ def _turnstile_blocked(message: str) -> bool:
 def _proxy_config() -> tuple[bool, str]:
     """读取代理配置，并检查代理是否可达。"""
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
-    proxy = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
+    proxy = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
 
     if is_proxy:
-        # 检查代理是否实际可用
+        # 检查代理端口是否开放（SOCKS5 不能用 requests 直测）
         try:
-            proxies = {"http": proxy, "https": proxy}
-            requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=8)
+            import socket
+            parsed = proxy.replace("socks5://", "").replace("http://", "")
+            host, _, port = parsed.partition(":")
+            sock = socket.create_connection((host, int(port or 1080)), timeout=5)
+            sock.close()
         except Exception:
             log.warning("代理 %s 不可达，回退到直连模式", proxy)
             return False, proxy
@@ -326,7 +329,6 @@ def _get_turnstile_token_via_browser(account: dict[str, Any], name: str) -> str:
 
     sb_kwargs: dict[str, Any] = {
         "uc": True,
-        "headless2": True,           # seleniumbase 的增强 headless 模式
         "browser": "chrome",
     }
 

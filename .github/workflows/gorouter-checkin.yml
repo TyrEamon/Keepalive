@@ -69,9 +69,9 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-          # 代理配置（如果 NODE_LINK 设置了，sing-box 会启动本地代理）
+          # 代理配置（如果 NODE_LINK 设置了，sing-box 会启动本地 socks5 代理）
           IS_PROXY: "true"
-          PROXY_SERVER: "http://127.0.0.1:1080"
+          PROXY_SERVER: "socks5://127.0.0.1:1080"
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python checkin_turnstile.py
 
       - name: 🧽 清理进程和临时文件
