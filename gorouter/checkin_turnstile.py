@@ -314,16 +314,59 @@ def call_checkin_api(account: dict[str, Any], turnstile_token: str = "") -> dict
 
 
 # ============================================================
-# 3. 浏览器获取 Turnstile token（seleniumbase UC 模式）
+# 3. 浏览器获取 Turnstile token（seleniumbase UC + CDP 注入）
 # ============================================================
+
+# CDP 注入脚本：Hook Shadow DOM 获取 Turnstile 复选框坐标（来自 katabump-renew）
+TURNSTILE_INJECT = """
+(function() {
+    if (window.self === window.top) return;
+    try {
+        var screenX = Math.floor(Math.random() * 400) + 800;
+        var screenY = Math.floor(Math.random() * 200) + 400;
+        Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
+        Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
+    } catch (e) { }
+    try {
+        var orig = Element.prototype.attachShadow;
+        Element.prototype.attachShadow = function(init) {
+            var root = orig.call(this, init);
+            if (root) {
+                var check = function() {
+                    var cb = root.querySelector('input[type="checkbox"]');
+                    if (cb) {
+                        var r = cb.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0 && window.innerWidth > 0) {
+                            window.__ts_data = {
+                                xR: (r.left + r.width / 2) / window.innerWidth,
+                                yR: (r.top + r.height / 2) / window.innerHeight
+                            };
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (!check()) {
+                    var obs = new MutationObserver(function() {
+                        if (check()) obs.disconnect();
+                    });
+                    obs.observe(root, { childList: true, subtree: true });
+                }
+            }
+            return root;
+        };
+    } catch (e) {}
+})();
+"""
+
 
 def _get_turnstile_token_via_browser(account: dict[str, Any], name: str) -> str:
     """
     使用 seleniumbase UC 模式启动浏览器：
-      - 挂载代理（如果配置了 NODE_LINK / IS_PROXY）
-      - 注入 session cookie
-      - 自动点击 Turnstile 复选框（uc_gui_click_captcha）
-      - 提取 cf-turnstile-response token
+      1. uc_open_with_reconnect 导航（自动应对 CF 拦截页）
+      2. 注入 CDP 脚本捕获 Turnstile 复选框坐标
+      3. CDP Input.dispatchMouseEvent 模拟真实鼠标点击
+      4. 提取 cf-turnstile-response token
     """
     is_proxy, proxy_server = _proxy_config()
 
@@ -331,24 +374,23 @@ def _get_turnstile_token_via_browser(account: dict[str, Any], name: str) -> str:
         "uc": True,
         "browser": "chrome",
     }
-
     if is_proxy:
         log.info("[%s] 🔗 挂载代理: %s", name, proxy_server)
         sb_kwargs["proxy"] = proxy_server
     else:
         log.info("[%s] 🍭 直连模式（未用代理）", name)
 
-    # 获取当前出口 IP（仅用于日志）
     ip = _get_current_ip(proxy_server if is_proxy else "")
     if ip:
         log.info("[%s] 📍 当前出口 IP: %s", name, ip)
 
+    token = ""
+
     with SB(**sb_kwargs) as sb:
         try:
-            # Step 1: 先访问首页
-            log.info("[%s] 正在访问 %s ...", name, BASE_URL)
-            sb.open(BASE_URL)
-            sb.wait_for_ready_state_complete()
+            # Step 1: 用 UC 模式打开首页并注入 cookie
+            log.info("[%s] 正在打开 %s (UC 模式)...", name, BASE_URL)
+            sb.uc_open_with_reconnect(BASE_URL, reconnect_time=4)
             sb.sleep(2)
 
             # Step 2: 注入 session cookie
@@ -360,66 +402,133 @@ def _get_turnstile_token_via_browser(account: dict[str, Any], name: str) -> str:
                     "domain": "gorouter.app",
                 })
 
-            # Step 3: 访问 dashboard 触发 Turnstile
+            # Step 3: 注入 CDP Turnstile 检测脚本
+            sb.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": TURNSTILE_INJECT,
+            })
+
+            # Step 4: 访问 dashboard
             overview_url = f"{BASE_URL}/dashboard/overview"
-            log.info("[%s] 正在访问 %s ...", name, overview_url)
-            sb.open(overview_url)
-            sb.wait_for_ready_state_complete()
+            log.info("[%s] 正在打开 %s (UC 模式)...", name, overview_url)
+            sb.uc_open_with_reconnect(overview_url, reconnect_time=4)
             sb.sleep(3)
 
-            # Step 4: 检测并解决 Turnstile
-            page_source = sb.get_page_source().lower()
-            has_turnstile = "turnstile" in page_source or "challenges.cloudflare.com" in page_source
+            current_url = sb.get_current_url()
 
-            if has_turnstile:
-                log.info("[%s] 🔒 检测到 Turnstile 验证，尝试自动破解...", name)
-                for attempt in range(1, 4):
-                    try:
-                        sb.uc_gui_click_captcha()
-                        log.info("[%s] 第 %d 次点击已执行，等待验证...", name, attempt)
-                        time.sleep(10)
-                    except Exception as e:
-                        log.warning("[%s] 点击 Turnstile 出错: %s", name, e)
-                        time.sleep(3)
+            # Step 5: 检测 Turnstile 并以 CDP 点击方式解决
+            page_src = sb.get_page_source().lower()
+            has_ts = "turnstile" in page_src or "challenges.cloudflare.com" in page_src
 
+            if has_ts:
+                log.info("[%s] 🔒 Turnstile 检测到，使用 CDP 点击破解...", name)
+                for attempt in range(1, 5):
+                    log.info("[%s] CDP 尝试 %d/4 ...", name, attempt)
+
+                    # 尝试在 iframe 中找到 Turnstile 数据并 CDP 点击
+                    clicked = sb.execute_script("""
+                        var data = null;
+                        for (var fi = 0; fi < window.frames.length; fi++) {
+                            try {
+                                var w = window.frames[fi];
+                                if (w.__ts_data) {
+                                    var doc = w.document;
+                                    var iframes = window.document.querySelectorAll('iframe');
+                                    var box = null;
+                                    for (var k = 0; k < iframes.length; k++) {
+                                        try {
+                                            if (iframes[k].contentWindow === w) {
+                                                box = iframes[k].getBoundingClientRect();
+                                                break;
+                                            }
+                                        } catch (e) {}
+                                    }
+                                    if (!box) {
+                                        try {
+                                            var fEl = w.frameElement;
+                                            if (fEl) box = fEl.getBoundingClientRect();
+                                        } catch (e) {}
+                                    }
+                                    if (box && box.width > 0) {
+                                        data = {
+                                            cx: Math.round(box.x + box.width * w.__ts_data.xR),
+                                            cy: Math.round(box.y + box.height * w.__ts_data.yR)
+                                        };
+                                        w.__ts_data = null;
+                                        break;
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+                        return data;
+                    """)
+
+                    if clicked and isinstance(clicked, dict) and "cx" in clicked:
+                        cx, cy = clicked["cx"], clicked["cy"]
+                        log.info("[%s] CDP 坐标 (%d, %d) 点击", name, cx, cy)
+                        sb.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                            "type": "mousePressed", "x": cx, "y": cy,
+                            "button": "left", "clickCount": 1,
+                        })
+                        time.sleep(0.1)
+                        sb.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                            "type": "mouseReleased", "x": cx, "y": cy,
+                            "button": "left", "clickCount": 1,
+                        })
+                        log.info("[%s] 等待 Turnstile 验证 (%ss)...", name, 8)
+                        time.sleep(8)
+                    else:
+                        # CDP 没找到坐标，用 uc_gui_click_captcha 兜底
+                        try:
+                            sb.uc_gui_click_captcha()
+                            log.info("[%s] uc_gui_click_captcha() 已执行, 等待...", name)
+                            time.sleep(10)
+                        except Exception:
+                            log.info("[%s] 无可点击目标，等待页面自解...", name)
+                            time.sleep(6)
+
+                    # 检查是否通过
                     token = _extract_token_from_page(sb)
                     if token:
-                        log.info("[%s] ✅ Turnstile 验证通过，token 已提取（长度: %d）", name, len(token))
-                        return token
-                    log.info("[%s] ⏳ 第 %d 次未通过，重试...", name, attempt)
+                        log.info("[%s] ✅ Turnstile 通过！token 长度: %d", name, len(token))
+                        break
+                    log.info("[%s] ⏳ 第 %d 次未获取到 token", name, attempt)
             else:
-                log.info("[%s] 未检测到 Turnstile 挑战", name)
+                log.info("[%s] 未检测到 Turnstile 页面元素", name)
 
-            # Step 5: 直接提取 token（可能已自动生成）
-            token = _extract_token_from_page(sb)
-            if token:
-                log.info("[%s] 提取到 Turnstile token（长度: %d）", name, len(token))
-            else:
-                log.warning("[%s] 未找到 Turnstile token", name)
-
-            return token or ""
+            # Step 6: 最后尝试提取 token
+            if not token:
+                token = _extract_token_from_page(sb)
+                if token:
+                    log.info("[%s] 从页面提取到 token（长度: %d）", name, len(token))
+                else:
+                    # 尝试从当前 URL 的页面中查找所有 input
+                    log.info("[%s] 当前 URL: %s", name, sb.get_current_url())
+                    log.warning("[%s] 未找到 cf-turnstile-response", name)
 
         except Exception as e:
-            log.error("[%s] 浏览器获取 token 异常: %s", name, e)
-            return ""
+            log.error("[%s] 浏览器异常: %s", name, e)
+
+    return token
 
 
 def _extract_token_from_page(sb) -> str:
     """从页面提取 cf-turnstile-response token。"""
-    try:
-        return sb.execute_script("""
-            var els = document.querySelectorAll(
-                'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
-            );
-            for (var i = 0; i < els.length; i++) {
-                if (els[i].value && els[i].value.trim().length > 0) {
-                    return els[i].value;
-                }
+    return sb.execute_script("""
+        var els = document.querySelectorAll(
+            'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+        );
+        for (var i = 0; i < els.length; i++) {
+            if (els[i].value && els[i].value.trim().length > 0) return els[i].value;
+        }
+        // 也尝试通过 turnstile API 获取
+        try {
+            if (typeof turnstile !== 'undefined' && turnstile.getResponse) {
+                var r = turnstile.getResponse();
+                if (r) return r;
             }
-            return '';
-        """)
-    except Exception:
-        return ""
+        } catch (e) {}
+        return '';
+    """)
 
 
 def _get_current_ip(proxy_server: str = "") -> str:
