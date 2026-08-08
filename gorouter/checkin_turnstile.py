@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-GoRouter 多账号每日签到（Playwright + CDP 绕过 Cloudflare Turnstile）
-
-从环境变量 GOROUTER_ACCOUNTS_JSON 读取账号列表。
+GoRouter 多账号每日签到（seleniumbase UC 模式 + 代理 + Turnstile 自动绕过）
 
 核心流程：
-  1. 先尝试纯 requests 签到（快速路径）
-  2. 如果 API 返回 Turnstile token 为空，则启动 Playwright 浏览器
-  3. 浏览器访问 gorouter.app，自动点击 Turnstile 复选框（CDP 模拟）
-  4. 从 DOM 提取 cf-turnstile-response token
-  5. 携带 token 再次调用签到 API
+  1. 快速路径：纯 requests 签到（无 Turnstile 问题时）
+  2. 如果 API 返回 Turnstile token 为空 → 启动 seleniumbase UC 浏览器
+     2a. 如果配置了 NODE_LINK 代理，自动挂载 sing-box 代理出口
+     2b. 浏览器自动点击 Turnstile 复选框（uc_gui_click_captcha）
+     2c. 提取 cf-turnstile-response token
+     2d. 携带 token 重试签到 API
+
+环境变量：
+  GOROUTER_ACCOUNTS_JSON  — 多账号配置（必填）
+  IS_PROXY                — "true" 启用代理（默认 false）
+  PROXY_SERVER            — 代理地址（默认 http://127.0.0.1:1080）
+  CHECKIN_INTERVAL_SECONDS — 每个账号间隔（默认 1.5）
+  TG_BOT_TOKEN / TG_CHAT_ID — Telegram 通知（可选）
 """
 
 from __future__ import annotations
@@ -23,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
-from playwright.sync_api import sync_playwright
+from seleniumbase import SB
 
 BASE_URL = "https://gorouter.app"
 
@@ -34,74 +40,17 @@ BJT = timezone(timedelta(hours=8))
 
 REQUEST_TIMEOUT = 20
 
-# --- Chrome / CDP 配置 ---
-DEBUG_PORT = 9222
-VIEWPORT_WIDTH = 1280
-VIEWPORT_HEIGHT = 720
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-log = logging.getLogger("gorouter-checkin-ts")
+log = logging.getLogger("gorouter-checkin-sb")
 
 
 # ============================================================
-# 1. 注入脚本：Hook Shadow DOM，获取 Turnstile 复选框坐标
-#    来自 katabump-renew 的核心技术
-# ============================================================
-
-INJECTED_SCRIPT = """
-(function() {
-    if (window.self === window.top) return;
-    try {
-        function getRandomInt(min, max) {
-            return Math.floor(Math.random() * (max - min + 1)) + min;
-        }
-        var screenX = getRandomInt(800, 1200);
-        var screenY = getRandomInt(400, 600);
-        Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
-        Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
-    } catch (e) { }
-
-    try {
-        var originalAttachShadow = Element.prototype.attachShadow;
-        Element.prototype.attachShadow = function(init) {
-            var shadowRoot = originalAttachShadow.call(this, init);
-            if (shadowRoot) {
-                var checkAndReport = function() {
-                    var checkbox = shadowRoot.querySelector('input[type="checkbox"]');
-                    if (checkbox) {
-                        var rect = checkbox.getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0 && window.innerWidth > 0 && window.innerHeight > 0) {
-                            var xRatio = (rect.left + rect.width / 2) / window.innerWidth;
-                            var yRatio = (rect.top + rect.height / 2) / window.innerHeight;
-                            window.__turnstile_data = { xRatio: xRatio, yRatio: yRatio };
-                            return true;
-                        }
-                    }
-                    return false;
-                };
-                if (!checkAndReport()) {
-                    var observer = new MutationObserver(function() {
-                        if (checkAndReport()) observer.disconnect();
-                    });
-                    observer.observe(shadowRoot, { childList: true, subtree: true });
-                }
-            }
-            return shadowRoot;
-        };
-    } catch (e) {
-        console.error('[注入] Hook attachShadow 失败:', e);
-    }
-})();
-"""
-
-
-# ============================================================
-# 2. 辅助函数
+# 1. 辅助函数
 # ============================================================
 
 def quota_to_usd(quota: Any) -> float:
@@ -178,17 +127,34 @@ def load_accounts() -> list[dict[str, Any]]:
 def _turnstile_blocked(message: str) -> bool:
     """判断 API 返回的消息是否指示 Turnstile token 缺失。"""
     msg_lower = message.lower()
-    return "turnstile" in msg_lower and ("为空" in message or "empty" in msg_lower or "token" in msg_lower)
+    return "turnstile" in msg_lower and (
+        "为空" in message or "empty" in msg_lower or "token" in msg_lower
+    )
+
+
+def _proxy_config() -> tuple[bool, str]:
+    """读取代理配置，并检查代理是否可达。"""
+    is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
+    proxy = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
+
+    if is_proxy:
+        # 检查代理是否实际可用
+        try:
+            proxies = {"http": proxy, "https": proxy}
+            requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=8)
+        except Exception:
+            log.warning("代理 %s 不可达，回退到直连模式", proxy)
+            return False, proxy
+
+    return is_proxy, proxy
 
 
 # ============================================================
-# 3. CDP Turnstile 解法（来自 katabump-renew）
+# 2. API 签到
 # ============================================================
 
 def _create_session_for_account(account: dict[str, Any]) -> requests.Session:
-    """创建带 cookie 和 header 的 requests.Session。"""
     session = requests.Session()
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -201,237 +167,16 @@ def _create_session_for_account(account: dict[str, Any]) -> requests.Session:
         "New-Api-User": account["user_id"],
         "Origin": BASE_URL,
     }
-
     if account.get("token"):
         headers["Authorization"] = f"Bearer {account['token']}"
-
     session.headers.update(headers)
-
     if account.get("session"):
         session.cookies.set(
-            "session",
-            account["session"],
-            domain="gorouter.app",
-            path="/",
-            secure=True,
+            "session", account["session"],
+            domain="gorouter.app", path="/", secure=True,
         )
-
     return session
 
-
-def dispatch_cdp_click(page, x: float, y: float) -> bool:
-    """通过 CDP 发送鼠标点击事件。"""
-    try:
-        cdp = page.context.new_cdp_session(page)
-        cdp.send("Input.dispatchMouseEvent", {
-            "type": "mousePressed",
-            "x": x,
-            "y": y,
-            "button": "left",
-            "clickCount": 1,
-        })
-        time.sleep(0.05 + 0.1 * (time.time() % 1))
-        cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseReleased",
-            "x": x,
-            "y": y,
-            "button": "left",
-            "clickCount": 1,
-        })
-        log.info(">> CDP 坐标 (%.2f, %.2f) 点击已发送", x, y)
-        return True
-    except Exception as e:
-        log.warning(">> CDP 点击失败: %s", e)
-        return False
-
-
-def _attempt_turnstile_cdp(page) -> bool:
-    """遍历所有 frame 查找 __turnstile_data 并点击。"""
-    for frame in page.frames:
-        try:
-            data = frame.evaluate("() => window.__turnstile_data")
-            if data:
-                log.info(">> 发现 Turnstile 数据: %s", data)
-                frame.evaluate("() => { window.__turnstile_data = null; }")
-                iframe_el = frame.frame_element()
-                if not iframe_el:
-                    continue
-                box = iframe_el.bounding_box()
-                if not box:
-                    continue
-                click_x = box["x"] + box["width"] * data["xRatio"]
-                click_y = box["y"] + box["height"] * data["yRatio"]
-                return dispatch_cdp_click(page, click_x, click_y)
-        except Exception:
-            pass
-    return False
-
-
-def _check_turnstile_success(page) -> bool:
-    """检查 Turnstile 是否已通过。"""
-    try:
-        return page.evaluate("""
-            () => {
-                var els = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-                return Array.from(els).some(function(el) { return el.value && el.value.trim().length > 0; });
-            }
-        """)
-    except Exception:
-        return False
-
-
-def _get_turnstile_token(page) -> str:
-    """从 DOM 提取 cf-turnstile-response 令牌。"""
-    try:
-        return page.evaluate("""
-            () => {
-                var els = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
-                for (var i = 0; i < els.length; i++) {
-                    if (els[i].value && els[i].value.trim().length > 0) {
-                        return els[i].value;
-                    }
-                }
-                return '';
-            }
-        """)
-    except Exception:
-        return ""
-
-
-def _has_turnstile_frame(page) -> bool:
-    """检测页面是否有 Turnstile iframe。"""
-    try:
-        return page.evaluate("""
-            () => document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]').length > 0
-        """)
-    except Exception:
-        return False
-
-
-def solve_turnstile(page, stage_name: str = "签到", max_attempts: int = 10,
-                    wait_after_click: int = 5000) -> bool:
-    """
-    解决 Cloudflare Turnstile 验证。
-    逻辑完全对应 katabump-renew 的 solveTurnstileIfPresent。
-    """
-    log.info("[%s] 开始检测 Cloudflare Turnstile...", stage_name)
-    saw_turnstile = False
-    for i in range(max_attempts):
-        if _has_turnstile_frame(page):
-            saw_turnstile = True
-        if _check_turnstile_success(page):
-            log.info("[%s] ✅ Turnstile 已通过验证。", stage_name)
-            return True
-        clicked = _attempt_turnstile_cdp(page)
-        if clicked:
-            saw_turnstile = True
-            log.info("[%s] 已点击 Turnstile，等待验证结果 (%dms)...",
-                     stage_name, wait_after_click)
-            page.wait_for_timeout(wait_after_click)
-            if _check_turnstile_success(page):
-                log.info("[%s] ✅ Turnstile 验证通过！", stage_name)
-                return True
-            log.info("[%s] ⚠️ 点击后验证未通过，继续重试...", stage_name)
-        if i < max_attempts - 1:
-            page.wait_for_timeout(1000)
-    if not saw_turnstile:
-        log.info("[%s] 未检测到 Turnstile。", stage_name)
-        return True
-    log.info("[%s] 检测到 Turnstile，但未能通过验证。", stage_name)
-    return False
-
-
-# ============================================================
-# 4. 浏览器获取 Turnstile token
-# ============================================================
-
-def _get_turnstile_token_via_browser(account: dict[str, Any], name: str) -> str:
-    """
-    启动 Playwright 浏览器，访问 gorouter.app，解决 Turnstile，
-    返回 cf-turnstile-response 令牌。
-    """
-    log.info("[%s] 启动浏览器获取 Turnstile token...", name)
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,  # CI 中需要 xvfb-run
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-gpu",
-                f"--window-size={VIEWPORT_WIDTH},{VIEWPORT_HEIGHT}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-dev-shm-usage",
-            ],
-        )
-
-        try:
-            context = browser.new_context(
-                viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/150.0.0.0 Safari/537.36"
-                ),
-            )
-
-            # 设置 session cookie
-            session_val = account.get("session", "")
-            if session_val:
-                context.add_cookies([{
-                    "name": "session",
-                    "value": session_val,
-                    "domain": "gorouter.app",
-                    "path": "/",
-                    "secure": True,
-                    "httpOnly": True,
-                }])
-
-            page = context.new_page()
-
-            # 注入 Turnstile 检测脚本（所有 frame 生效）
-            page.add_init_script(INJECTED_SCRIPT)
-
-            # 访问首页
-            log.info("[%s] 正在访问 %s ...", name, BASE_URL)
-            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000)
-
-            # 访问 overview 触发完整页面加载
-            overview_url = f"{BASE_URL}/dashboard/overview"
-            log.info("[%s] 正在访问 %s ...", name, overview_url)
-            page.goto(overview_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)
-
-            # 检测并解决 Turnstile
-            ts_ok = solve_turnstile(page, "登录验证", 10, 5000)
-
-            if not ts_ok:
-                log.warning("[%s] Turnstile 验证失败", name)
-                return ""
-
-            page.wait_for_timeout(2000)
-
-            # 提取 token
-            token = _get_turnstile_token(page)
-            if token:
-                log.info("[%s] 成功提取 Turnstile token (长度: %d)", name, len(token))
-            else:
-                log.warning("[%s] 未找到 Turnstile token", name)
-
-            return token
-
-        except Exception as e:
-            log.error("[%s] 浏览器获取 token 异常: %s", name, e)
-            return ""
-        finally:
-            browser.close()
-
-
-# ============================================================
-# 5. 签到 API（requests）
-# ============================================================
 
 def call_checkin_api(account: dict[str, Any], turnstile_token: str = "") -> dict[str, Any]:
     """
@@ -445,12 +190,11 @@ def call_checkin_api(account: dict[str, Any], turnstile_token: str = "") -> dict
             "reward_usd": float,
             "balance_usd": float,
             "username": str,
-            "need_turnstile": bool,   # 标识是否需要 Turnstile token
+            "need_turnstile": bool,
         }
     """
     session = _create_session_for_account(account)
 
-    # 携带 Turnstile token（New-API 典型 header）
     if turnstile_token:
         session.headers["Turnstile"] = turnstile_token
 
@@ -466,10 +210,7 @@ def call_checkin_api(account: dict[str, Any], turnstile_token: str = "") -> dict
 
     # 1. 查询用户信息
     try:
-        resp = session.get(
-            f"{BASE_URL}/api/user/self",
-            timeout=REQUEST_TIMEOUT,
-        )
+        resp = session.get(f"{BASE_URL}/api/user/self", timeout=REQUEST_TIMEOUT)
         payload = resp.json()
         if resp.status_code < 400 and payload.get("success"):
             info = payload.get("data") or {}
@@ -494,10 +235,7 @@ def call_checkin_api(account: dict[str, Any], turnstile_token: str = "") -> dict
 
     # 2. 查询签到状态
     try:
-        resp = session.get(
-            f"{BASE_URL}/api/user/checkin",
-            timeout=REQUEST_TIMEOUT,
-        )
+        resp = session.get(f"{BASE_URL}/api/user/checkin", timeout=REQUEST_TIMEOUT)
         payload = resp.json()
         if resp.status_code < 400 and payload.get("success"):
             data = payload.get("data") or {}
@@ -521,22 +259,17 @@ def call_checkin_api(account: dict[str, Any], turnstile_token: str = "") -> dict
 
     # 3. 执行签到 POST
     try:
-        resp = session.post(
-            f"{BASE_URL}/api/user/checkin",
-            json={},
-            timeout=REQUEST_TIMEOUT,
-        )
+        resp = session.post(f"{BASE_URL}/api/user/checkin", json={}, timeout=REQUEST_TIMEOUT)
         payload = resp.json()
         msg = str(payload.get("message") or f"HTTP {resp.status_code}")
 
-        # 检查是否 Turnstile token 为空
+        # Turnstile 拦截
         if not turnstile_token and _turnstile_blocked(msg):
             log.warning("签到被 Turnstile 拦截: %s", msg)
             result["message"] = msg
             result["need_turnstile"] = True
             return result
 
-        # 检查失败原因
         if resp.status_code >= 400:
             log.error("签到请求失败: %s", msg)
             result["message"] = f"签到失败：{msg}"
@@ -562,10 +295,7 @@ def call_checkin_api(account: dict[str, Any], turnstile_token: str = "") -> dict
 
         # 刷新余额
         try:
-            resp2 = session.get(
-                f"{BASE_URL}/api/user/self",
-                timeout=REQUEST_TIMEOUT,
-            )
+            resp2 = session.get(f"{BASE_URL}/api/user/self", timeout=REQUEST_TIMEOUT)
             payload2 = resp2.json()
             if payload2.get("success") and payload2.get("data"):
                 result["balance_usd"] = quota_to_usd(payload2["data"].get("quota"))
@@ -581,17 +311,131 @@ def call_checkin_api(account: dict[str, Any], turnstile_token: str = "") -> dict
 
 
 # ============================================================
-# 6. 单账号处理（快速路径 + Turnstile 回退）
+# 3. 浏览器获取 Turnstile token（seleniumbase UC 模式）
+# ============================================================
+
+def _get_turnstile_token_via_browser(account: dict[str, Any], name: str) -> str:
+    """
+    使用 seleniumbase UC 模式启动浏览器：
+      - 挂载代理（如果配置了 NODE_LINK / IS_PROXY）
+      - 注入 session cookie
+      - 自动点击 Turnstile 复选框（uc_gui_click_captcha）
+      - 提取 cf-turnstile-response token
+    """
+    is_proxy, proxy_server = _proxy_config()
+
+    sb_kwargs: dict[str, Any] = {
+        "uc": True,
+        "headless2": True,           # seleniumbase 的增强 headless 模式
+        "browser": "chrome",
+    }
+
+    if is_proxy:
+        log.info("[%s] 🔗 挂载代理: %s", name, proxy_server)
+        sb_kwargs["proxy"] = proxy_server
+    else:
+        log.info("[%s] 🍭 直连模式（未用代理）", name)
+
+    # 获取当前出口 IP（仅用于日志）
+    ip = _get_current_ip(proxy_server if is_proxy else "")
+    if ip:
+        log.info("[%s] 📍 当前出口 IP: %s", name, ip)
+
+    with SB(**sb_kwargs) as sb:
+        try:
+            # Step 1: 先访问首页
+            log.info("[%s] 正在访问 %s ...", name, BASE_URL)
+            sb.open(BASE_URL)
+            sb.wait_for_ready_state_complete()
+            sb.sleep(2)
+
+            # Step 2: 注入 session cookie
+            session_val = account.get("session", "")
+            if session_val:
+                sb.add_cookie({
+                    "name": "session",
+                    "value": session_val,
+                    "domain": "gorouter.app",
+                })
+
+            # Step 3: 访问 dashboard 触发 Turnstile
+            overview_url = f"{BASE_URL}/dashboard/overview"
+            log.info("[%s] 正在访问 %s ...", name, overview_url)
+            sb.open(overview_url)
+            sb.wait_for_ready_state_complete()
+            sb.sleep(3)
+
+            # Step 4: 检测并解决 Turnstile
+            page_source = sb.get_page_source().lower()
+            has_turnstile = "turnstile" in page_source or "challenges.cloudflare.com" in page_source
+
+            if has_turnstile:
+                log.info("[%s] 🔒 检测到 Turnstile 验证，尝试自动破解...", name)
+                for attempt in range(1, 4):
+                    try:
+                        sb.uc_gui_click_captcha()
+                        log.info("[%s] 第 %d 次点击已执行，等待验证...", name, attempt)
+                        time.sleep(10)
+                    except Exception as e:
+                        log.warning("[%s] 点击 Turnstile 出错: %s", name, e)
+                        time.sleep(3)
+
+                    token = _extract_token_from_page(sb)
+                    if token:
+                        log.info("[%s] ✅ Turnstile 验证通过，token 已提取（长度: %d）", name, len(token))
+                        return token
+                    log.info("[%s] ⏳ 第 %d 次未通过，重试...", name, attempt)
+            else:
+                log.info("[%s] 未检测到 Turnstile 挑战", name)
+
+            # Step 5: 直接提取 token（可能已自动生成）
+            token = _extract_token_from_page(sb)
+            if token:
+                log.info("[%s] 提取到 Turnstile token（长度: %d）", name, len(token))
+            else:
+                log.warning("[%s] 未找到 Turnstile token", name)
+
+            return token or ""
+
+        except Exception as e:
+            log.error("[%s] 浏览器获取 token 异常: %s", name, e)
+            return ""
+
+
+def _extract_token_from_page(sb) -> str:
+    """从页面提取 cf-turnstile-response token。"""
+    try:
+        return sb.execute_script("""
+            var els = document.querySelectorAll(
+                'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+            );
+            for (var i = 0; i < els.length; i++) {
+                if (els[i].value && els[i].value.trim().length > 0) {
+                    return els[i].value;
+                }
+            }
+            return '';
+        """)
+    except Exception:
+        return ""
+
+
+def _get_current_ip(proxy_server: str = "") -> str:
+    try:
+        proxies = None
+        if proxy_server:
+            proxies = {"http": proxy_server, "https": proxy_server}
+        resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=10)
+        return resp.text.strip()
+    except Exception:
+        return ""
+
+
+# ============================================================
+# 4. 单账号处理（快速路径 + Turnstile 回退）
 # ============================================================
 
 def process_account(account: dict[str, Any], index: int, total: int) -> dict[str, Any]:
-    """
-    处理单个账号签到。
-
-    策略：
-      1. 快速路径：纯 requests 调用 API
-      2. 如果 API 返回需要 Turnstile → 启动浏览器获取 token → 重试
-    """
     name = account["name"]
     log.info("-" * 48)
     log.info("[%d/%d] 开始处理：%s", index, total, name)
@@ -614,7 +458,6 @@ def process_account(account: dict[str, Any], index: int, total: int) -> dict[str
         result.update(api_result)
         return result
 
-    # 如果不是 Turnstile 问题，直接返回错误
     if not api_result.get("need_turnstile", False):
         result.update(api_result)
         return result
@@ -629,7 +472,6 @@ def process_account(account: dict[str, Any], index: int, total: int) -> dict[str
         log.error("[%s] %s", name, result["message"])
         return result
 
-    # 携带 token 重试 API
     log.info("[%s] 携带 Turnstile token 重试签到 API...", name)
     api_result = call_checkin_api(account, token)
     result.update(api_result)
@@ -643,12 +485,12 @@ def process_account(account: dict[str, Any], index: int, total: int) -> dict[str
 
 
 # ============================================================
-# 7. 通知
+# 5. 通知
 # ============================================================
 
 def send_notification(results: list[dict[str, Any]]) -> None:
     try:
-        from notify import send_tg_notification
+        from notify import send_tg_notification  # type: ignore
         send_tg_notification(results, today_text())
     except ImportError as exc:
         log.warning("无法导入 notify 模块：%s", exc)
@@ -663,13 +505,19 @@ def save_updated_accounts(accounts: list[dict[str, Any]]) -> None:
 
 
 # ============================================================
-# 8. 主入口
+# 6. 主入口
 # ============================================================
 
 def main() -> int:
     log.info("=" * 48)
-    log.info("GoRouter 多账号签到（纯 API + Turnstile 自动绕过回退）")
+    log.info("GoRouter 多账号签到（seleniumbase UC + Turnstile 自动绕过）")
     log.info("目标站点：%s", BASE_URL)
+
+    is_proxy, proxy_server = _proxy_config()
+    if is_proxy:
+        log.info("代理模式：已启用（%s）", proxy_server)
+    else:
+        log.info("代理模式：未启用（直连）")
 
     try:
         accounts = load_accounts()

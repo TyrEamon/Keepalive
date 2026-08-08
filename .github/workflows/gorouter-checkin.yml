@@ -33,12 +33,19 @@ jobs:
           cache: pip
           cache-dependency-path: gorouter/requirements.txt
 
-      - name: 📦 安装依赖
+      - name: 🛠️ 安装系统依赖和 Python 依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq
           pip install -r requirements.txt
-          playwright install --with-deps chromium
+          seleniumbase install chromedriver
+
+      - name: ⚙ 设置代理 (sing-box)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
       - name: 🔍 检查多账号配置
         env:
@@ -51,7 +58,7 @@ jobs:
             exit 1
           fi
 
-      - name: ✅ 执行多账号签到（Turnstile 自动绕过）
+      - name: ✅ 执行多账号签到（seleniumbase UC + Turnstile 自动绕过）
         env:
           GOROUTER_ACCOUNTS_JSON: ${{ secrets.GOROUTER_ACCOUNTS_JSON }}
 
@@ -61,20 +68,25 @@ jobs:
           # Telegram 通知，可不配置
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        # 使用 xvfb-run 模拟有头环境，配合 Playwright 绕过 Turnstile
+
+          # 代理配置（如果 NODE_LINK 设置了，sing-box 会启动本地代理）
+          IS_PROXY: "true"
+          PROXY_SERVER: "http://127.0.0.1:1080"
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python checkin_turnstile.py
+
+      - name: 🧽 清理进程和临时文件
+        if: always()
+        run: |
+          pkill -f sing-box || true
+          pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
 
       - name: 💾 可选更新多账号 Secret
         if: always()
-
-        # 即使 GH_TOKEN 权限不足，也不让整个签到任务变红
         continue-on-error: true
-
         env:
-          # Fine-grained PAT
-          # 需要当前仓库 Secrets: Read and write
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-
         run: |
           if [[ ! -f accounts.updated.json ]]; then
             echo "⏭️ 没有生成 accounts.updated.json，跳过写回"
