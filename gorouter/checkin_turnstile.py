@@ -166,7 +166,7 @@ def _create_session_for_account(account: dict[str, Any]) -> requests.Session:
         ),
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
-        "Referer": f"{BASE_URL}/dashboard/overview",
+        "Referer": f"{BASE_URL}/profile",
         "New-Api-User": account["user_id"],
         "Origin": BASE_URL,
     }
@@ -408,9 +408,9 @@ def _get_turnstile_token_via_browser(account: dict[str, Any], name: str) -> str:
             })
 
             # Step 4: 访问 dashboard
-            overview_url = f"{BASE_URL}/dashboard/overview"
-            log.info("[%s] 正在打开 %s (UC 模式)...", name, overview_url)
-            sb.uc_open_with_reconnect(overview_url, reconnect_time=4)
+            profile_url = f"{BASE_URL}/profile"
+            log.info("[%s] 正在打开 %s (UC 模式)...", name, profile_url)
+            sb.uc_open_with_reconnect(profile_url, reconnect_time=4)
             sb.sleep(3)
 
             current_url = sb.get_current_url()
