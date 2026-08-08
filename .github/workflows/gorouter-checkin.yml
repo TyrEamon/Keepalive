@@ -34,7 +34,11 @@ jobs:
           cache-dependency-path: gorouter/requirements.txt
 
       - name: 📦 安装依赖
-        run: pip install -r requirements.txt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
 
       - name: 🔍 检查多账号配置
         env:
@@ -47,7 +51,7 @@ jobs:
             exit 1
           fi
 
-      - name: ✅ 执行多账号签到
+      - name: ✅ 执行多账号签到（Turnstile 自动绕过）
         env:
           GOROUTER_ACCOUNTS_JSON: ${{ secrets.GOROUTER_ACCOUNTS_JSON }}
 
@@ -57,7 +61,8 @@ jobs:
           # Telegram 通知，可不配置
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python checkin.py
+        # 使用 xvfb-run 模拟有头环境，配合 Playwright 绕过 Turnstile
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python checkin_turnstile.py
 
       - name: 💾 可选更新多账号 Secret
         if: always()
