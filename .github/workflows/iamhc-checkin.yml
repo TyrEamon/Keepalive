@@ -28,12 +28,16 @@ jobs:
       - name: 🐍 设置 Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: "3.11"
           cache: pip
           cache-dependency-path: iamhc/requirements.txt
 
-      - name: 📦 安装依赖
-        run: pip install -r requirements.txt
+      - name: 🛠️ 安装系统依赖和 Python 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
+          pip install -r requirements.txt
+          seleniumbase install chromedriver
 
       - name: 🔍 检查多账号配置
         env:
@@ -58,7 +62,19 @@ jobs:
           # Telegram 通知，可不配置
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python checkin.py
+
+          # 代理默认关闭，直接用 GitHub Actions 出口 IP
+          # 需要时把 IS_PROXY 改成 "true"，并确保 PROXY_SERVER 在 runner 上可达
+          IS_PROXY: "false"
+          PROXY_SERVER: "socks5://127.0.0.1:1080"
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python checkin.py
+
+      - name: 🧽 清理进程和临时文件
+        if: always()
+        run: |
+          pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
 
       - name: 💾 可选写回更新后的账号 Session
         if: always()

@@ -127,12 +127,13 @@ IAMHC AI 多账号签到
 
 | | 旧版 | 本版 |
 |---|---|---|
-| 认证 | session → 失败后密码登录 | **只用 session** |
-| Turnstile | 卡在 `token 为空` | 不涉及 |
-| 依赖 | `requests` + `seleniumbase` | **只有 `requests`** |
+| 认证 | session → 失败后密码登录 | **只用 session**，不做密码登录 |
+| Turnstile | 卡在 `token 为空` | 签到被拦截时，用 seleniumbase 浏览器取 token 后重试（`turnstile.py`） |
+| 依赖 | `requests` + `seleniumbase` | `requests` + `pysocks` + `seleniumbase`（seleniumbase 仅在被拦截时才导入） |
 | session 失效 | 报错 + 工作流报红 | **Telegram 提醒 + 退出码 0** |
 | 写回 Secret | 保留 disabled 账号 | 保留（同样） |
 | 每账号 base_url | 支持 | 支持 |
 
-`seleniumbase` 已从 `requirements.txt` 移除 —— 那条路（用浏览器过 Turnstile）
-在 GitHub Actions 的机房 IP 上基本走不通，留着只会拖慢每次运行。
+登录接口本身仍然要 Turnstile，所以 session 失效后依旧需要人工换；
+`turnstile.py` 只负责「已登录、但签到接口要 Turnstile token」这一种情况。
+代理由环境变量 `IS_PROXY` / `PROXY_SERVER` 控制，默认关闭（Actions 直连）。

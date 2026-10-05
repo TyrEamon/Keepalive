@@ -34,6 +34,12 @@ from urllib.parse import urlparse
 
 import requests
 
+from turnstile import (
+    get_turnstile_token,
+    proxy_config,
+    requests_proxies,
+)
+
 
 DEFAULT_BASE_URL = (
     os.getenv("IAMHC_BASE_URL") or "https://api.hcnsec.cn"
@@ -63,7 +69,6 @@ AUTH_HINTS = (
     "登录过期",
     "无权",
     "unauthorized",
-    "session",
 )
 
 
@@ -227,12 +232,27 @@ def load_accounts() -> tuple[list[dict[str, Any]], list[Any]]:
     return accounts, original
 
 
-def create_session(account: dict[str, Any]) -> requests.Session:
+def turnstile_blocked(message: str) -> bool:
+    """判断接口返回是否表示缺少 Turnstile token。"""
+    lowered = (message or "").lower()
+
+    return "turnstile" in lowered and (
+        "为空" in message or "empty" in lowered or "token" in lowered
+    )
+
+
+def create_session(
+    account: dict[str, Any],
+    proxy: str = "",
+) -> requests.Session:
     """创建带有账号 Cookie 和请求头的 Session。"""
     base_url = account["base_url"]
     host = urlparse(base_url).hostname or ""
 
     session = requests.Session()
+
+    if proxy:
+        session.proxies.update(requests_proxies(proxy))
 
     headers = {
         "User-Agent": (
@@ -428,6 +448,7 @@ def run_account(
     account: dict[str, Any],
     index: int,
     total: int,
+    proxy: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """执行单个账号签到。"""
     name = account["name"]
@@ -452,7 +473,7 @@ def run_account(
     # 保留原账号中的其他自定义字段
     updated_account = dict(account)
 
-    session = create_session(account)
+    session = create_session(account, proxy)
 
     # 验证登录并获取当前余额
     ok, user_info, message, status = get_user_info(session, base_url)
@@ -528,7 +549,29 @@ def run_account(
 
     else:
         # 今日尚未签到，执行签到
-        ok, checkin_result, message, _ = do_checkin(session, base_url)
+        ok, checkin_result, message, status = do_checkin(session, base_url)
+
+        # 被 Turnstile 拦截：起浏览器拿 token，带上后重试一次
+        if not ok and turnstile_blocked(message):
+            log.warning("%s：签到被 Turnstile 拦截：%s", name, message)
+
+            host = urlparse(base_url).hostname or ""
+            token = get_turnstile_token(
+                base_url,
+                get_current_session_cookie(session, host)
+                or account.get("session", ""),
+                name,
+                proxy,
+            )
+
+            if token:
+                session.headers["Turnstile"] = token
+                session.headers["Origin"] = base_url
+                ok, checkin_result, message, status = do_checkin(
+                    session, base_url
+                )
+            else:
+                message = "Turnstile 验证失败，无法获取 token"
 
         if not ok:
             result["message"] = f"签到失败：{message}"
@@ -661,12 +704,23 @@ def main() -> int:
     except ValueError:
         interval = 1.5
 
+    use_proxy, proxy_server = proxy_config(
+        os.getenv("IS_PROXY", ""),
+        os.getenv("PROXY_SERVER", ""),
+    )
+    proxy = proxy_server if use_proxy else ""
+
+    if proxy:
+        log.info("代理模式：已启用（%s）", proxy)
+    else:
+        log.info("代理模式：未启用（直连）")
+
     results: list[dict[str, Any]] = []
     updated_accounts: list[dict[str, Any]] = []
 
     for index, account in enumerate(accounts, start=1):
         result, updated_account = run_account(
-            account, index, len(accounts)
+            account, index, len(accounts), proxy
         )
 
         results.append(result)
