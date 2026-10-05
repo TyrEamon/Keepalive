@@ -10,11 +10,12 @@ seleniumbase 在函数内部才导入，没被拦截时不装它也能跑 checki
 
 from __future__ import annotations
 
+import base64
 import logging
 import socket
 import time
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 
 import requests
 
@@ -40,10 +41,42 @@ def normalize_proxy(proxy: str) -> str:
     if scheme == "socks":
         scheme = "socks5"
 
+    username = parsed.username or ""
+    password = parsed.password or ""
+
+    # 部分代理供应商把 base64(username:password) 放在 @ 前面。
+    if username and not password:
+        try:
+            padded_username = username + "=" * (-len(username) % 4)
+            decoded = base64.b64decode(
+                padded_username, validate=True
+            ).decode("utf-8")
+            decoded_user, separator, decoded_password = decoded.partition(":")
+
+            if separator and decoded_user and decoded_password:
+                username = decoded_user
+                password = decoded_password
+        except (ValueError, UnicodeDecodeError):
+            pass
+
+    auth = ""
+
+    if username:
+        auth = quote(username, safe="")
+
+        if password:
+            auth += f":{quote(password, safe='')}"
+
+        auth += "@"
+
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    netloc = f"{auth}{host}{port}"
+
     return urlunparse(
         (
             scheme,
-            parsed.netloc,
+            netloc,
             parsed.path,
             parsed.params,
             parsed.query,

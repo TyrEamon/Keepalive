@@ -893,7 +893,7 @@ def main() -> int:
     proxy = proxy_server if use_proxy else ""
 
     if proxy:
-        log.info("代理模式：已启用（%s）", proxy)
+        log.info("代理模式：已启用")
     else:
         log.info("代理模式：未启用（直连）")
 
