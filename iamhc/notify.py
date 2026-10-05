@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 IAMHC 多账号 Telegram 汇总通知。
+
+相比旧版新增：
+- 「需要重新认证」单独成行并高亮，不再混在普通失败里
+- 汇总里单独统计需重认证数量
 """
 
 from __future__ import annotations
@@ -47,6 +51,14 @@ def build_result_line(item: dict[str, Any]) -> str:
             f"　💰 余额：{balance}"
         )
 
+    # 需要人工换 session —— 这条最重要，单独给提示
+    if item.get("needs_reauth"):
+        return (
+            f"🔑 <b>{name}</b>：<b>Session 已失效，需要你更新</b>\n"
+            f"　📋 浏览器登录后取 Cookies 里的 <code>session</code> 值\n"
+            f"　⚙️ 更新 Secret <code>IAMHC_ACCOUNTS_JSON</code> 中该账号的 session 字段"
+        )
+
     message = escape(str(item.get("message") or "未知错误"))
     return f"❌ <b>{name}</b>：{message}"
 
@@ -57,6 +69,7 @@ def split_messages(header: str, lines: list[str], footer: str) -> list[str]:
 
     for line in lines:
         candidate = f"{current}\n\n{line}"
+
         if len(candidate) + len(footer) + 2 > TELEGRAM_TEXT_LIMIT:
             messages.append(f"{current}\n\n{footer}")
             current = f"{header}\n\n{line}"
@@ -106,12 +119,23 @@ def send_tg_notification(
 
     success_count = sum(1 for item in results if item.get("success"))
     failed_count = len(results) - success_count
+    reauth_count = sum(1 for item in results if item.get("needs_reauth"))
 
-    header = (
-        "<b>IAMHC AI 多账号签到</b>\n"
-        f"📅 {escape(date_text)}"
-    )
+    # 有账号需要换 session 时，标题直接点明，避免被当成普通失败忽略
+    if reauth_count:
+        header = (
+            "<b>IAMHC AI 多账号签到</b>\n"
+            f"📅 {escape(date_text)}\n"
+            f"🔑 <b>{reauth_count} 个账号需要更新 Session</b>"
+        )
+    else:
+        header = (
+            "<b>IAMHC AI 多账号签到</b>\n"
+            f"📅 {escape(date_text)}"
+        )
+
     lines = [build_result_line(item) for item in results]
+
     footer = (
         "----------------\n"
         f"成功：<b>{success_count}</b>　"
@@ -119,7 +143,11 @@ def send_tg_notification(
         f"总计：<b>{len(results)}</b>"
     )
 
+    if reauth_count:
+        footer += f"\n需重认证：<b>{reauth_count}</b>"
+
     all_ok = True
+
     for message in split_messages(header, lines, footer):
         if not send_one_message(message):
             all_ok = False
