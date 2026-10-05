@@ -191,6 +191,10 @@ def load_accounts() -> tuple[list[dict[str, Any]], list[Any]]:
             item.get("token") or ""
         ).strip()
 
+        account["refresh"] = str(
+            item.get("refresh") or ""
+        ).strip()
+
         account["base_url"] = str(
             item.get("base_url") or DEFAULT_BASE_URL
         ).strip().rstrip("/")
@@ -215,9 +219,10 @@ def load_accounts() -> tuple[list[dict[str, Any]], list[Any]]:
             not account["session"]
             and not account["session_b64"]
             and not account["token"]
+            and not account["refresh"]
         ):
             log.warning(
-                "跳过 %s：至少需要 session 或 token",
+                "跳过 %s：至少需要 refresh、session 或 token",
                 account["name"],
             )
             continue
@@ -441,6 +446,128 @@ def get_current_session_cookie(
     return str(candidates[-1].value or "")
 
 
+ACCESS_TOKEN_KEYS = ("access_token", "accessToken", "token", "jwt")
+
+
+def find_access_token(node: Any) -> str:
+    """在 refresh 响应里递归找 access token。"""
+    if isinstance(node, dict):
+        for key in ACCESS_TOKEN_KEYS:
+            value = node.get(key)
+
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        for value in node.values():
+            found = find_access_token(value)
+
+            if found:
+                return found
+
+    elif isinstance(node, list):
+        for value in node:
+            found = find_access_token(value)
+
+            if found:
+                return found
+
+    return ""
+
+
+def payload_shape(node: Any, depth: int = 0) -> Any:
+    """只保留字段名和类型，用于排查时安全地打印响应结构。"""
+    if isinstance(node, dict) and depth < 3:
+        return {key: payload_shape(value, depth + 1) for key, value in node.items()}
+
+    if isinstance(node, list):
+        return [payload_shape(node[0], depth + 1)] if node else []
+
+    return type(node).__name__
+
+
+def get_cookie_value(session: requests.Session, name: str) -> str:
+    """取 cookie jar 里最后一个同名 cookie 的值。"""
+    values = [c.value for c in session.cookies if c.name == name]
+
+    return str(values[-1] or "") if values else ""
+
+
+def refresh_access_token(
+    session: requests.Session,
+    base_url: str,
+    refresh: str,
+) -> tuple[bool, str, str, int]:
+    """
+    POST /api/user/auth/refresh，用 new_api_refresh cookie 换 access token。
+
+    返回：ok, access_token, message, status。
+    服务端会通过 Set-Cookie 下发新的 new_api_refresh，由 cookie jar 接收。
+    """
+    host = urlparse(base_url).hostname or ""
+    secure = base_url.startswith("https://")
+
+    session.cookies.set(
+        "new_api_refresh",
+        refresh,
+        domain=host,
+        path="/api/user/auth",
+        secure=secure,
+    )
+    session.cookies.set(
+        "new_api_has_session", "1", domain=host, path="/", secure=secure
+    )
+
+    try:
+        response = session.post(
+            f"{base_url}/api/user/auth/refresh",
+            headers={
+                "Content-Type": None,
+                "Origin": base_url,
+                "Referer": f"{base_url}/profile",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        return False, "", f"请求异常：{exc}", 0
+
+    status = response.status_code
+
+    try:
+        payload = response.json()
+    except ValueError:
+        log.warning(
+            "refresh 返回非 JSON：HTTP %d，cf-mitigated=%s，内容前 200 字：%s",
+            status,
+            response.headers.get("cf-mitigated", "-"),
+            response.text[:200].replace("\n", " "),
+        )
+        return False, "", f"HTTP {status}，返回内容不是 JSON", status
+
+    if not isinstance(payload, dict):
+        return False, "", f"HTTP {status}，返回格式异常", status
+
+    message = str(payload.get("message") or "").strip()
+
+    if status >= 400 or not payload.get("success", True):
+        return False, "", message or f"HTTP {status}", status
+
+    data = payload.get("data")
+    token = (
+        data.strip()
+        if isinstance(data, str) and data.strip()
+        else find_access_token(payload)
+    )
+
+    if not token:
+        log.error(
+            "refresh 响应里没有找到 access token，响应结构：%s",
+            json.dumps(payload_shape(payload), ensure_ascii=False),
+        )
+        return False, "", "refresh 响应中没有找到 access token", status
+
+    return True, token, message, status
+
+
 def looks_like_auth_failure(message: str, status: int) -> bool:
     """判断这次失败是不是「session 失效」，而不是普通故障。"""
     # 非 JSON 的 403 多半是 Cloudflare 拦截页，不是 session 过期
@@ -486,16 +613,46 @@ def run_account(
 
     session = create_session(account, proxy)
 
+    # 新版站点：用 new_api_refresh 换 access token，refresh 每次都会轮换
+    refresh_value = account.get("refresh", "")
+
+    if refresh_value:
+        ok, access_token, message, status = refresh_access_token(
+            session, base_url, refresh_value
+        )
+
+        new_refresh = get_cookie_value(session, "new_api_refresh")
+
+        if new_refresh and new_refresh != refresh_value:
+            updated_account["refresh"] = new_refresh
+            log.info("%s：refresh token 已轮换，将写回 Secret", name)
+
+        if not ok:
+            log.warning("%s：刷新 token 失败：HTTP %d，%s", name, status, message)
+
+            if looks_like_auth_failure(message, status):
+                result["needs_reauth"] = True
+                result["message"] = (
+                    "Refresh token 已失效，需要人工更新 refresh"
+                    "（浏览器重新登录后复制 new_api_refresh）"
+                )
+            else:
+                result["message"] = f"刷新 token 失败：{message}"
+
+            return result, updated_account
+
+        session.headers["Authorization"] = f"Bearer {access_token}"
+
     # 验证登录并获取当前余额
     ok, user_info, message, status = get_user_info(session, base_url)
 
     if not ok:
         log.warning("%s：/api/user/self 失败：HTTP %d，%s", name, status, message)
 
-        if looks_like_auth_failure(message, status):
+        if not refresh_value and looks_like_auth_failure(message, status):
             result["needs_reauth"] = True
             result["message"] = (
-                "Session 已失效，需要人工更新 session（登录接口需 Turnstile）"
+                "登录凭证已失效，需要人工更新（重新登录后复制 new_api_refresh 填入 refresh 字段）"
             )
             log.warning("%s：%s", name, result["message"])
         else:
@@ -569,13 +726,20 @@ def run_account(
             log.warning("%s：签到被 Turnstile 拦截：%s", name, message)
 
             host = urlparse(base_url).hostname or ""
-            token = get_turnstile_token(
+            token, browser_refresh = get_turnstile_token(
                 base_url,
-                get_current_session_cookie(session, host)
-                or account.get("session", ""),
                 name,
                 proxy,
+                session_value=(
+                    get_current_session_cookie(session, host)
+                    or account.get("session", "")
+                ),
+                refresh_value=updated_account.get("refresh", ""),
             )
+
+            # 浏览器打开页面时会自己刷新并轮换 refresh，必须以它的为准
+            if browser_refresh:
+                updated_account["refresh"] = browser_refresh
 
             if token:
                 session.headers["Turnstile"] = token
@@ -676,6 +840,11 @@ def save_updated_accounts(
             merged[source_index]["session"] = new_session
             merged[source_index].pop("session_b64", None)
 
+        new_refresh = str(account.get("refresh") or "").strip()
+
+        if new_refresh:
+            merged[source_index]["refresh"] = new_refresh
+
     with open("accounts.updated.json", "w", encoding="utf-8") as file:
         json.dump(merged, file, ensure_ascii=False, indent=2)
 
@@ -732,9 +901,23 @@ def main() -> int:
     updated_accounts: list[dict[str, Any]] = []
 
     for index, account in enumerate(accounts, start=1):
-        result, updated_account = run_account(
-            account, index, len(accounts), proxy
-        )
+        try:
+            result, updated_account = run_account(
+                account, index, len(accounts), proxy
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("%s：处理异常", account["name"])
+            result = {
+                "name": account["name"],
+                "success": False,
+                "status": "failed",
+                "needs_reauth": False,
+                "message": f"处理异常：{exc}",
+                "reward_usd": 0.0,
+                "balance_usd": 0.0,
+                "username": "",
+            }
+            updated_account = dict(account)
 
         results.append(result)
         updated_accounts.append(updated_account)

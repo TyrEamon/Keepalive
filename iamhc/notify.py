@@ -54,9 +54,9 @@ def build_result_line(item: dict[str, Any]) -> str:
     # 需要人工换 session —— 这条最重要，单独给提示
     if item.get("needs_reauth"):
         return (
-            f"🔑 <b>{name}</b>：<b>Session 已失效，需要你更新</b>\n"
-            f"　📋 浏览器登录后取 Cookies 里的 <code>session</code> 值\n"
-            f"　⚙️ 更新 Secret <code>IAMHC_ACCOUNTS_JSON</code> 中该账号的 session 字段"
+            f"🔑 <b>{name}</b>：<b>登录凭证已失效，需要你更新</b>\n"
+            f"　📋 无痕窗口重新登录后，取 Cookies 里的 <code>new_api_refresh</code> 值\n"
+            f"　⚙️ 更新 Secret <code>IAMHC_ACCOUNTS_JSON</code> 中该账号的 refresh 字段"
         )
 
     message = escape(str(item.get("message") or "未知错误"))

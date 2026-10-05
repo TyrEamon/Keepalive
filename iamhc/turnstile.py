@@ -205,22 +205,91 @@ def _click_checkin_button(sb: Any, name: str) -> bool:
     return False
 
 
+def _inject_cookies(
+    sb: Any,
+    host: str,
+    session_value: str,
+    refresh_value: str,
+) -> None:
+    """用 CDP 注入登录 cookie（refresh 是 HttpOnly 且限定路径，add_cookie 做不到）。"""
+    cookies: list[dict[str, Any]] = []
+
+    if refresh_value:
+        cookies.append(
+            {
+                "name": "new_api_refresh",
+                "value": refresh_value,
+                "domain": host,
+                "path": "/api/user/auth",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Strict",
+            }
+        )
+        cookies.append(
+            {
+                "name": "new_api_has_session",
+                "value": "1",
+                "domain": host,
+                "path": "/",
+                "secure": True,
+                "sameSite": "Strict",
+            }
+        )
+
+    if session_value:
+        cookies.append(
+            {
+                "name": "session",
+                "value": session_value,
+                "domain": host,
+                "path": "/",
+                "secure": True,
+            }
+        )
+
+    for cookie in cookies:
+        try:
+            sb.execute_cdp_cmd("Network.setCookie", cookie)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("注入 cookie %s 失败：%s", cookie["name"], exc)
+
+
+def _read_refresh(sb: Any, host: str) -> str:
+    """读浏览器里当前的 new_api_refresh（页面加载时前端会自己刷新并轮换它）。"""
+    try:
+        cookies = sb.execute_cdp_cmd("Network.getAllCookies", {}).get("cookies", [])
+    except Exception:  # noqa: BLE001
+        return ""
+
+    for cookie in cookies:
+        if cookie.get("name") == "new_api_refresh" and host in str(
+            cookie.get("domain", "")
+        ):
+            return str(cookie.get("value") or "")
+
+    return ""
+
+
 def get_turnstile_token(
     base_url: str,
-    session_value: str,
     name: str,
     proxy: str = "",
-) -> str:
+    session_value: str = "",
+    refresh_value: str = "",
+) -> tuple[str, str]:
     """
-    启动 UC 浏览器，注入 session，打开 /profile，点签到并过 Turnstile。
+    启动 UC 浏览器，注入登录 cookie，打开 /profile，点签到并过 Turnstile。
 
-    proxy 为空表示直连。拿不到 token 时返回空字符串。
+    返回 (turnstile_token, 浏览器里最新的 refresh)。
+    refresh 在浏览器里可能已被轮换，调用方必须以返回值为准。
+    proxy 为空表示直连。拿不到 token 时 token 为空字符串。
     """
     try:
         from seleniumbase import SB
     except ImportError:
         log.error("[%s] 未安装 seleniumbase，无法过 Turnstile", name)
-        return ""
+        return "", ""
 
     host = urlparse(base_url).hostname or ""
 
@@ -238,6 +307,7 @@ def get_turnstile_token(
         log.info("[%s] 当前出口 IP: %s", name, ip)
 
     token = ""
+    refresh_out = ""
 
     with SB(**sb_kwargs) as sb:
         try:
@@ -245,14 +315,7 @@ def get_turnstile_token(
             sb.uc_open_with_reconnect(base_url, reconnect_time=4)
             sb.sleep(2)
 
-            if session_value:
-                sb.add_cookie(
-                    {
-                        "name": "session",
-                        "value": session_value,
-                        "domain": host,
-                    }
-                )
+            _inject_cookies(sb, host, session_value, refresh_value)
 
             sb.execute_cdp_cmd(
                 "Page.addScriptToEvaluateOnNewDocument",
@@ -344,4 +407,6 @@ def get_turnstile_token(
         except Exception as exc:  # noqa: BLE001
             log.error("[%s] 浏览器异常: %s", name, exc)
 
-    return token
+        refresh_out = _read_refresh(sb, host)
+
+    return token, refresh_out
