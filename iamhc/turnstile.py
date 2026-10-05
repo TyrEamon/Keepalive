@@ -204,44 +204,80 @@ return '';
 """
 
 CLICK_CHECKIN_JS = """
-var kws = ['每日签到', '签到', 'Check-in', 'Check in', 'Daily'];
-var els = document.querySelectorAll(
-    'button, a, [role="button"], div[class*="checkin"], div[class*="check-in"]'
-);
-for (var i = 0; i < els.length; i++) {
-    var t = (els[i].innerText || els[i].textContent || '').trim();
-    if (!t || els[i].offsetParent === null) continue;
-    for (var k = 0; k < kws.length; k++) {
-        if (t.indexOf(kws[k]) >= 0) { els[i].click(); return t; }
+(function() {
+    var exact = ['立即签到', '每日签到', 'Check-in', 'Check in'];
+    var partial = ['签到', 'check-in', 'check in'];
+    var selectors = [
+        'button', 'a', '[role="button"]',
+        '[class*="checkin"]', '[class*="check-in"]',
+        '[class*="CheckIn"]', '[class*="签到"]'
+    ];
+
+    function visible(el) {
+        var style = window.getComputedStyle(el);
+        var rect = el.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden'
+            && rect.width > 0 && rect.height > 0;
     }
-}
-return '';
+
+    function clickCandidate(el) {
+        if (!visible(el)) return '';
+        var text = (el.innerText || el.textContent || '').trim();
+        if (!text || text.length > 30) return '';
+        var lower = text.toLowerCase();
+        var matched = exact.some(function(k) { return text === k; })
+            || partial.some(function(k) { return lower.indexOf(k.toLowerCase()) >= 0; });
+        if (!matched) return '';
+        el.click();
+        return text;
+    }
+
+    var els = document.querySelectorAll(selectors.join(','));
+    for (var i = 0; i < els.length; i++) {
+        var clicked = clickCandidate(els[i]);
+        if (clicked) return clicked;
+    }
+
+    // 某些前端组件不是 button，而是带 role 或点击处理器的普通元素。
+    var all = document.querySelectorAll('body *');
+    for (var j = 0; j < all.length; j++) {
+        var fallback = clickCandidate(all[j]);
+        if (fallback) return fallback;
+    }
+
+    return '';
+})();
 """
 
 
 def _click_checkin_button(sb: Any, name: str) -> bool:
-    """点击「每日签到」，触发 Turnstile 弹窗。"""
+    """等待并点击「立即签到」，触发 Turnstile 弹窗。"""
     selectors = [
+        'button:contains("立即签到")',
         'button:contains("每日签到")',
         'button:contains("签到")',
         'button:contains("Check-in")',
         'button:contains("Check in")',
     ]
 
-    for sel in selectors:
-        try:
-            if sb.is_element_visible(sel):
-                sb.click(sel)
-                log.info("[%s] 已点击签到按钮: %s", name, sel)
-                return True
-        except Exception:  # noqa: BLE001
-            continue
+    for attempt in range(1, 9):
+        for sel in selectors:
+            try:
+                if sb.is_element_visible(sel):
+                    sb.click(sel)
+                    log.info("[%s] 已点击签到按钮: %s", name, sel)
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
 
-    clicked = sb.execute_script(CLICK_CHECKIN_JS)
+        clicked = sb.execute_script(CLICK_CHECKIN_JS)
 
-    if clicked:
-        log.info("[%s] 已通过 JS 点击签到按钮: %s", name, clicked)
-        return True
+        if clicked:
+            log.info("[%s] 已通过页面文本点击签到按钮: %s", name, clicked)
+            return True
+
+        if attempt < 8:
+            sb.sleep(2)
 
     return False
 
