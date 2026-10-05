@@ -142,4 +142,10 @@ IAMHC AI 多账号签到
 
 登录接口本身仍然要 Turnstile，所以 refresh 失效后依旧需要人工换；
 `turnstile.py` 只负责「已登录、但签到接口要 Turnstile token」这一种情况。
-代理由环境变量 `IS_PROXY` / `PROXY_SERVER` 控制，默认关闭（Actions 直连）。
+代理由 workflow 的 `IAMHC_USE_PROXY` Variable 和 `IAMHC_PROXY_SERVER` Secret 控制，默认关闭（Actions 直连）。
+需要非直连时，在仓库 Settings → Secrets and variables → Actions 中设置：
+
+- Variable：`IAMHC_USE_PROXY` = `true`
+- Secret：`IAMHC_PROXY_SERVER` = 完整代理地址，例如 `socks://用户:密码@主机:端口#us`
+
+代码会自动把 `socks://` 转成 `socks5://`，并忽略末尾的 `#us` 标签。代理凭证不要写入 workflow 或提交到仓库。

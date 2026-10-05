@@ -63,10 +63,10 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-          # 代理默认关闭，直接用 GitHub Actions 出口 IP
-          # 需要时把 IS_PROXY 改成 "true"，并确保 PROXY_SERVER 在 runner 上可达
-          IS_PROXY: "false"
-          PROXY_SERVER: "socks5://127.0.0.1:1080"
+          # 代理默认关闭；需要非直连时，在仓库 Variables 设置 IAMHC_USE_PROXY=true
+          # 代理完整地址放在仓库 Secret IAMHC_PROXY_SERVER，不要写入公开文件
+          IS_PROXY: ${{ vars.IAMHC_USE_PROXY || 'false' }}
+          PROXY_SERVER: ${{ secrets.IAMHC_PROXY_SERVER }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" python checkin.py
 
       - name: 🧽 清理进程和临时文件
@@ -82,6 +82,7 @@ jobs:
         env:
           # Fine-grained PAT，需要当前仓库 Secrets: Read and write
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          # IAMHC_PROXY_SERVER 只在执行步骤读取，不写入日志或仓库
         run: |
           if [[ ! -f accounts.updated.json ]]; then
             echo "⏭️ 没有生成 accounts.updated.json，跳过写回"

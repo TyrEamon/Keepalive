@@ -14,7 +14,7 @@ import logging
 import socket
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -24,10 +24,51 @@ log = logging.getLogger("iamhc-turnstile")
 DEFAULT_PROXY_SERVER = "socks5://127.0.0.1:1080"
 
 
+def normalize_proxy(proxy: str) -> str:
+    """标准化代理 URL，并丢弃服务商附带的 fragment 标签（例如 #us）。"""
+    value = (proxy or "").strip()
+
+    if not value:
+        return ""
+
+    if "://" not in value:
+        value = f"socks5://{value}"
+
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+
+    if scheme == "socks":
+        scheme = "socks5"
+
+    return urlunparse(
+        (
+            scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            "",
+        )
+    )
+
+
+def mask_proxy(proxy: str) -> str:
+    """隐藏代理凭证，避免把用户名和密码写入日志。"""
+    parsed = urlparse(proxy)
+
+    if not parsed.username and not parsed.password:
+        return proxy
+
+    hostname = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+
+    return f"{parsed.scheme}://***:***@{hostname}{port}"
+
+
 def proxy_config(is_proxy_env: str, proxy_env: str) -> tuple[bool, str]:
-    """读取代理配置并检查端口是否可达，不可达则回退直连。"""
+    """读取代理配置并检查代理是否可达，不可达则回退直连。"""
     enabled = (is_proxy_env or "false").strip().lower() == "true"
-    proxy = (proxy_env or "").strip() or DEFAULT_PROXY_SERVER
+    proxy = normalize_proxy(proxy_env) or DEFAULT_PROXY_SERVER
 
     if not enabled:
         return False, proxy
@@ -40,7 +81,7 @@ def proxy_config(is_proxy_env: str, proxy_env: str) -> tuple[bool, str]:
         )
         sock.close()
     except Exception:  # noqa: BLE001
-        log.warning("代理 %s 不可达，回退到直连模式", proxy)
+        log.warning("代理 %s 不可达，回退到直连模式", mask_proxy(proxy))
         return False, proxy
 
     return True, proxy
@@ -296,7 +337,7 @@ def get_turnstile_token(
     sb_kwargs: dict[str, Any] = {"uc": True, "browser": "chrome"}
 
     if proxy:
-        log.info("[%s] 挂载代理: %s", name, proxy)
+        log.info("[%s] 挂载代理: %s", name, mask_proxy(proxy))
         sb_kwargs["proxy"] = proxy
     else:
         log.info("[%s] 直连模式（未用代理）", name)
