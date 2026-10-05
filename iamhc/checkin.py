@@ -335,6 +335,13 @@ def request_json(
     try:
         payload = response.json()
     except ValueError:
+        log.warning(
+            "%s 返回非 JSON：HTTP %d，cf-mitigated=%s，内容前 200 字：%s",
+            path,
+            status,
+            response.headers.get("cf-mitigated", "-"),
+            response.text[:200].replace("\n", " "),
+        )
         return (
             False,
             {},
@@ -436,6 +443,10 @@ def get_current_session_cookie(
 
 def looks_like_auth_failure(message: str, status: int) -> bool:
     """判断这次失败是不是「session 失效」，而不是普通故障。"""
+    # 非 JSON 的 403 多半是 Cloudflare 拦截页，不是 session 过期
+    if "不是 JSON" in (message or ""):
+        return False
+
     if status in {401, 403}:
         return True
 
@@ -479,6 +490,8 @@ def run_account(
     ok, user_info, message, status = get_user_info(session, base_url)
 
     if not ok:
+        log.warning("%s：/api/user/self 失败：HTTP %d，%s", name, status, message)
+
         if looks_like_auth_failure(message, status):
             result["needs_reauth"] = True
             result["message"] = (
